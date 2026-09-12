@@ -1,0 +1,4 @@
+defaults:
+  - default
+
+root_path: ${hydra:runtime.cwd}/data/mini

@@ -1,0 +1,9 @@
+# @package _global_
+
+defaults:
+  - override /model: space_group
+
+experiment_name: space_group
+train:
+  trainer:
+    max_epochs: 200

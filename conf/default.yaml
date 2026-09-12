@@ -1,0 +1,24 @@
+defaults:
+  - data: mp20
+  - model: discrete_flow
+  - optim: adamw
+  - train: default
+  - logging: csv
+  - _self_
+  - experiment: discrete_flow
+
+experiment_name: discrete_flow
+seed: 42
+resume_from: null
+
+paths:
+  output_dir: ${oc.env:WYCKOFFFLOW_OUTPUT_DIR,outputs}
+
+hydra:
+  run:
+    dir: ${paths.output_dir}/${now:%Y-%m-%d}/${now:%H-%M-%S}_${experiment_name}
+  sweep:
+    dir: ${paths.output_dir}/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}_${experiment_name}
+    subdir: ${hydra.job.num}
+  job:
+    chdir: false

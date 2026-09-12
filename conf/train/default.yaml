@@ -1,0 +1,18 @@
+trainer:
+  fast_dev_run: false
+  accelerator: auto
+  devices: 1
+  max_epochs: 1000
+  deterministic: true
+  check_val_every_n_epoch: 1
+  num_sanity_val_steps: 0
+  log_every_n_steps: 10
+  enable_progress_bar: true
+  gradient_clip_val: null
+
+checkpoint:
+  monitor: val/loss
+  mode: min
+  save_top_k: 1
+  save_last: true
+  every_n_epochs: 100

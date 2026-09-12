@@ -1,0 +1,10 @@
+_target_: models.pl_models.space_group.SpaceGroupModule
+
+model_config:
+  num_elements: ${data.num_elements}
+  max_num_atoms: 54
+  hidden_dim: 256
+  composition_encoder_dim: 256
+  compatibility: true
+  mlp_hidden_layers: 2
+  mlp_activation: SiLU

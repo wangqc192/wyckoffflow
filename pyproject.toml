@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wyckoffflow-pl"
+version = "0.1.0"
+description = "Lightning data pipeline for Wyckoff crystal generation"
+requires-python = ">=3.10,<3.13"
+license = { text = "MIT" }
+dependencies = [
+  "chemparse>=0.3,<0.4",
+  "hydra-core>=1.3.2,<1.4",
+  "matplotlib>=3.10,<4",
+  "numpy>=2.2,<3",
+  "omegaconf>=2.3,<2.4",
+  "pandas>=2.3,<3",
+  "pytorch-lightning>=2.4,<2.5",
+  "torch==2.4.1",
+  "torch-geometric>=2.6.1,<2.7",
+  "wyckoffflow",
+]
+
+[dependency-groups]
+dev = [
+  "black>=25.1,<27",
+  "pytest>=9.1,<10",
+  "ruff>=0.12,<1",
+]
+
+[tool.setuptools.packages.find]
+include = ["models*"]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+wyckoffflow = { path = "../wyckoffflow", editable = true }
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

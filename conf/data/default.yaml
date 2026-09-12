@@ -1,0 +1,29 @@
+root_path: ${hydra:runtime.cwd}/data/mp20
+dataset_name: mp20
+num_elements: 118
+
+datamodule:
+  _target_: models.pl_data.datamodule.CrystDataModule
+  datasets:
+    train:
+      _target_: models.pl_data.dataset.CrystalDataset
+      data: ${data.root_path}/train.csv
+      num_elements: ${data.num_elements}
+    val:
+      - _target_: models.pl_data.dataset.CrystalDataset
+        data: ${data.root_path}/val.csv
+        num_elements: ${data.num_elements}
+    test:
+      - _target_: models.pl_data.dataset.CrystalDataset
+        data: ${data.root_path}/test.csv
+        num_elements: ${data.num_elements}
+
+  num_workers:
+    train: 0
+    val: 0
+    test: 0
+  batch_size:
+    train: 32
+    val: 32
+    test: 32
+  pin_memory: false
