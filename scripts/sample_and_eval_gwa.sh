@@ -17,7 +17,15 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "${script_dir}/.." && pwd)
 cd "$repo_root"
 
-result_dir="results/${result_name}"
+if [[ -d "$model_path" ]]; then
+    run_dir=${model_path%/}
+elif [[ $(basename -- "$(dirname -- "$model_path")") == "checkpoints" ]]; then
+    run_dir=$(dirname -- "$(dirname -- "$model_path")")
+else
+    run_dir=$(dirname -- "$model_path")
+fi
+
+result_dir="${run_dir}/${result_name}"
 sample_path="${result_dir}/top-${num_evals}"
 template_csv="${result_dir}/top-${num_evals}.csv"
 evaluation_csv="${result_dir}/top-${num_evals}_gwa.csv"

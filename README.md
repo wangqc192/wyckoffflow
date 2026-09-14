@@ -156,15 +156,17 @@ scripts/sample_and_eval_gwa.sh \
   test
 ~~~
 
-The third argument is the folder name under `results/`. This writes the raw
-samples to `results/test/top-20.pt`, the generated templates to
-`results/test/top-20.csv`, and the per-target evaluation to
-`results/test/top-20_gwa.csv`. The G-W-A Top-K match-rate summary is written to
-`results/test/top-20_gwa.json`, including the matched and total material counts.
-The optional positional arguments are `INPUT_CSV` and `TARGET_CSV`, in that
-order. The same `example/input_test.csv` can be reused for any Top-K because the
-Bash argument is passed to `sample_wy.py --num_evals` and
-`eval_gwa.py --top_k`.
+The third argument is the output folder name under the checkpoint's training
+run directory. For the command above, this writes the raw samples to
+`outputs/2026-09-10/10-27-26_discrete_flow/test/top-20.pt`, the generated
+templates to the corresponding `top-20.csv`, and the per-target evaluation to
+`top-20_gwa.csv`. The G-W-A Top-K match-rate summary is written to
+`top-20_gwa.json` in the same folder, including the matched and total material
+counts. Passing the training run directory instead of a checkpoint file uses
+the same output location. The optional positional arguments are `INPUT_CSV`
+and `TARGET_CSV`, in that order. The same `example/input_test.csv` can be reused
+for any Top-K because the Bash argument is passed to
+`sample_wy.py --num_evals` and `eval_gwa.py --top_k`.
 
 The three data/mini splits contain the same 64 examples and are intended only
 for pipeline checks; use `data=mini` for that check. The default `data=mp20`
