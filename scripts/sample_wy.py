@@ -35,11 +35,12 @@ def _format_formula(counts):
     )
 
 
-def _sample_or_skip(batch, model, count_conserving):
+def _sample_or_skip(batch, model, count_conserving, flow_steps):
     try:
         return model.sample(
             batch,
             count_conserving=count_conserving,
+            flow_steps=flow_steps,
         ).to_data_list()
     except ValueError as error:
         if str(error) != "Space group cannot realize the requested composition":
@@ -48,7 +49,7 @@ def _sample_or_skip(batch, model, count_conserving):
             generated_samples = []
             for target in batch.to_data_list():
                 generated_samples.extend(
-                    _sample_or_skip(target, model, count_conserving)
+                    _sample_or_skip(target, model, count_conserving, flow_steps)
                 )
             return generated_samples
 
@@ -59,12 +60,14 @@ def _sample_or_skip(batch, model, count_conserving):
 
 
 @torch.inference_mode()
-def flow(loader, model, count_conserving=True):
+def flow(loader, model, count_conserving=True, flow_steps=None):
     """Generate Wyckoff graphs for every formula in ``loader``."""
     generated_samples = []
     with tqdm(total=len(loader.dataset), desc="Sampling", unit="target") as progress:
         for batch in loader:
-            generated_samples.extend(_sample_or_skip(batch, model, count_conserving))
+            generated_samples.extend(
+                _sample_or_skip(batch, model, count_conserving, flow_steps)
+            )
             progress.update(batch.num_graphs)
     return generated_samples
 
@@ -126,6 +129,8 @@ def main(args):
     model_path = Path(args.model_path)
     model, _, cfg = load_model(model_path, load_data=False)
     num_elements = int(cfg.model.model_config.num_elements)
+    if args.flow_steps is None:
+        args.flow_steps = int(cfg.model.model_config.flow_steps)
 
     if args.formula_file is not None:
         print(f"Trying reading sampling formulas from '{args.formula_file}'...")
@@ -157,6 +162,7 @@ def main(args):
         test_loader,
         model,
         count_conserving=args.count_conserving,
+        flow_steps=args.flow_steps,
     )
     stop_time = time.time()
     print("Model time:", stop_time - start_time)
@@ -186,6 +192,11 @@ if __name__ == "__main__":
     )
     parser.add_argument("--space_group", type=int)
     parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument(
+        "--flow_steps",
+        type=int,
+        help="number of inference flow steps; defaults to the checkpoint value",
+    )
     parser.add_argument(
         "--count_conserving",
         action=argparse.BooleanOptionalAction,

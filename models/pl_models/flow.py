@@ -157,7 +157,7 @@ class DiscreteFlowModule(OptimizedLightningModule):
     _mask_training_logits = _mask_logits
 
     @torch.inference_mode()
-    def sample(self, batch, count_conserving=None):
+    def sample(self, batch, count_conserving=None, flow_steps=None):
         """Sample graphs from formula-conditioned records in ``batch``."""
         required = ("formula", "num_evals", "space_group")
         missing = [name for name in required if not hasattr(batch, name)]
@@ -176,6 +176,9 @@ class DiscreteFlowModule(OptimizedLightningModule):
             raise ValueError("space_group must contain one value per formula")
         if not torch.all((1 <= space_groups) & (space_groups <= 230)):
             raise ValueError("space_group must lie in 1..230")
+        sample_flow_steps = self.flow_steps if flow_steps is None else int(flow_steps)
+        if sample_flow_steps <= 0:
+            raise ValueError("flow_steps must be positive")
 
         data_t = self._build_source_from_compositions(
             formulas.repeat_interleave(num_evals, dim=0),
@@ -187,10 +190,10 @@ class DiscreteFlowModule(OptimizedLightningModule):
             ),
         )
 
-        for step in range(self.flow_steps):
+        for step in range(sample_flow_steps):
             time = torch.full(
                 (data_t.num_graphs,),
-                step / self.flow_steps,
+                step / sample_flow_steps,
                 device=self.device,
             )
             zero_logits, inf_logits = self.decoder(data_t, time)
@@ -199,7 +202,7 @@ class DiscreteFlowModule(OptimizedLightningModule):
                 inf_logits,
                 data_t,
             )
-            jump_probability = 1 / (self.flow_steps - step)
+            jump_probability = 1 / (sample_flow_steps - step)
             data_t.x_0_dof = categorical_flow_step(
                 data_t.x_0_dof,
                 zero_logits,

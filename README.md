@@ -121,6 +121,11 @@ uv run python scripts/sample_wy.py \
 `--num_evals` applies the same sampling count to every formula; it is not stored
 in the formula CSV.
 
+`--flow_steps` optionally overrides the checkpoint's inference step count for one
+sampling run. If omitted, the checkpoint value is used and the effective value is
+stored in the output `.pt` file. The Bash pipeline accepts this as its optional
+sixth argument; use a different `RESULT_NAME` for each step-count comparison.
+
 Sampling enforces the conditioned composition by default. Use
 `--no-count_conserving` to disable this repair step.
 If a formula and space group cannot realize the requested complete composition,
@@ -162,14 +167,16 @@ scripts/sample_and_eval_gwa.sh \
 ~~~
 
 The third argument is the output folder name under the checkpoint's training
-run directory. For the command above, this writes the raw samples to
-`outputs/2026-09-10/10-27-26_discrete_flow/test/top-20.pt`, the generated
-templates to the corresponding `top-20.csv`, and the per-target evaluation to
-`top-20_gwa.csv`. The G-W-A Top-K match-rate summary is written to
-`top-20_gwa.json` in the same folder, including the matched and total material
-counts. Passing the training run directory instead of a checkpoint file uses
-the same output location. The optional positional arguments are `INPUT_CSV`
-and `TARGET_CSV`, in that order. The same `example/input_test.csv` can be reused
+run directory. For the command above, whose checkpoint uses 100 flow steps, this
+writes the raw samples to
+`outputs/2026-09-10/10-27-26_discrete_flow/test/top-20_flow_steps-100.pt`, the
+generated templates to the corresponding `.csv`, and the per-target evaluation
+to `top-20_flow_steps-100_gwa.csv`. The G-W-A Top-K match-rate summary is written
+to `top-20_flow_steps-100_gwa.json` in the same folder, including the matched and
+total material counts. Passing the training run directory instead of a checkpoint uses
+the same output location. The optional positional arguments are `INPUT_CSV`,
+`TARGET_CSV`, and `FLOW_STEPS`, in that order. The same `example/input_test.csv`
+can be reused
 for any Top-K because the Bash argument is passed to
 `sample_wy.py --num_evals` and `eval_gwa.py --top_k`.
 
