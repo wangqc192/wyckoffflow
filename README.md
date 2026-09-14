@@ -30,6 +30,11 @@ Train the discrete flow model:
 uv run python -m models.run experiment=discrete_flow
 ~~~
 
+The full MP20 configuration uses prototype-frequency resampling with
+`prototype_sampling_alpha=0.25` to reduce the dominance of frequent structural
+prototypes. Set `data.datamodule.prototype_sampling_alpha=0` to run the original
+uniform-sampling baseline; `0.5` is the stronger inverse-sqrt comparison.
+
 Train the space-group model:
 
 ~~~bash

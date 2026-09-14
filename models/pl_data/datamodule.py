@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -11,7 +12,7 @@ import numpy as np
 import pytorch_lightning as pl
 import torch
 from omegaconf import DictConfig
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, WeightedRandomSampler
 from torch_geometric.loader import DataLoader
 
 from models.common.utils import PROJECT_ROOT
@@ -41,12 +42,16 @@ class CrystDataModule(pl.LightningDataModule):
         num_workers: Mapping[str, int],
         batch_size: Mapping[str, int],
         pin_memory: bool = False,
+        prototype_sampling_alpha: float = 0.0,
     ) -> None:
         super().__init__()
         self.datasets = datasets
         self.num_workers = num_workers
         self.batch_size = batch_size
         self.pin_memory = pin_memory
+        self.prototype_sampling_alpha = float(prototype_sampling_alpha)
+        if self.prototype_sampling_alpha < 0:
+            raise ValueError("prototype_sampling_alpha must be non-negative")
 
         self.train_dataset: Dataset | None = None
         self.val_datasets: list[Dataset] | None = None
@@ -70,9 +75,28 @@ class CrystDataModule(pl.LightningDataModule):
             ]
 
     def train_dataloader(self) -> DataLoader:
+        sampler = None
+        shuffle = True
+        if self.prototype_sampling_alpha > 0:
+            prototype_keys = self.train_dataset.prototype_keys
+            frequencies = Counter(prototype_keys)
+            weights = torch.tensor(
+                [
+                    frequencies[key] ** (-self.prototype_sampling_alpha)
+                    for key in prototype_keys
+                ],
+                dtype=torch.double,
+            )
+            sampler = WeightedRandomSampler(
+                weights=weights,
+                num_samples=len(self.train_dataset),
+                replacement=True,
+            )
+            shuffle = False
         return DataLoader(
             self.train_dataset,
-            shuffle=True,
+            sampler=sampler,
+            shuffle=shuffle,
             batch_size=self.batch_size.train,
             num_workers=self.num_workers.train,
             pin_memory=self.pin_memory,

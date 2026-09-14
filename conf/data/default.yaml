@@ -27,3 +27,4 @@ datamodule:
     val: 32
     test: 32
   pin_memory: false
+  prototype_sampling_alpha: 0.0

@@ -10,6 +10,7 @@ from typing import Any
 
 import pandas as pd
 import torch
+from aviary.wren.utils import get_prototype_from_protostructure
 from torch.utils.data import Dataset
 from torch_geometric.data import Data
 
@@ -43,6 +44,7 @@ class CrystalDataset(Dataset):
         self.num_elements = num_elements
         self.transform = transform
         self.data = self._load(data)
+        self._prototype_keys: tuple[str, ...] | None = None
 
     @staticmethod
     def _load(data: Any) -> list[Any]:
@@ -85,6 +87,28 @@ class CrystalDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.data)
+
+    @property
+    def prototype_keys(self) -> tuple[str, ...]:
+        """Return one canonical prototype label for each material record."""
+
+        if self._prototype_keys is None:
+            keys = []
+            for record in self.data:
+                if isinstance(record, pd.Series):
+                    record = record.to_dict()
+                if isinstance(record, Mapping):
+                    label = record.get("aflow_label") or record.get("wyckoff_spglib")
+                else:
+                    label = getattr(record, "aflow_label", None)
+                if label is None:
+                    raise ValueError(
+                        "prototype sampling requires aflow_label or "
+                        "wyckoff_spglib in every record"
+                    )
+                keys.append(get_prototype_from_protostructure(str(label)))
+            self._prototype_keys = tuple(keys)
+        return self._prototype_keys
 
     def __getitem__(self, index: int) -> Data:
         record = self.data[index]
