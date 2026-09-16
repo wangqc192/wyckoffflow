@@ -52,17 +52,16 @@ def extract_wyckoff_data_and_properties(data_frame_row: pd.Series) -> pd.Series:
 
 
 def map_element_to_index(element: str | int) -> int:
-    """Map an element symbol to its one-based periodic-table index."""
+    """"element symbols to number"""
 
-    return element if isinstance(element, int) else chemical_symbols.index(str(element))
+    return chemical_symbols.index(str(element))
 
 
 def map_wyckoff_label_to_index(wyckoff_label: str | int) -> int:
-    """Map a Wyckoff letter to the zero-based position index used by the model."""
+    """Wyckoff letter to number."""
 
-    if isinstance(wyckoff_label, int):
-        return wyckoff_label
-    return wyckoff_label_to_index[str(wyckoff_label)] - 1
+    # Change to zero-based indexing
+    return wyckoff_label_to_index.get(wyckoff_label) - 1
 
 
 def matrix_list(rows: int, cols: int, value: int = 0) -> list[list[int]]:

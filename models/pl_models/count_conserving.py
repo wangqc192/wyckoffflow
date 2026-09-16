@@ -242,6 +242,10 @@ def repair_batch_to_compositions(
     repair_indices = torch.nonzero(
         torch.any(decoded.round() != targets.round(), dim=1)
     ).flatten()
+    print(
+        f"[count_conserving] repair {repair_indices.numel()}"
+        f"/{targets.shape[0]} graphs"
+    )
     if repair_indices.numel() == 0:
         return data, 0
 

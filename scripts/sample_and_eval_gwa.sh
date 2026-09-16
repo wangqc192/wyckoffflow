@@ -10,9 +10,9 @@ fi
 model_path=$1
 num_evals=$2
 result_name=$3
-input_csv=${4:-example/input_test.csv}
-target_csv=${5:-data/mp20/test.csv}
-flow_steps=${6:-}
+flow_steps=${4:-}
+input_csv=${5:-example/input_test.csv}
+target_csv=${6:-data/mp20/test.csv}
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "${script_dir}/.." && pwd)
@@ -54,7 +54,7 @@ sample_args=(
     --model_path "$model_path" \
     --formula_file "$input_csv" \
     --num_evals "$num_evals" \
-    --batch_size 64 \
+    --batch_size 128 \
     --save_path "$sample_path"
 )
 if [[ -n "$flow_steps" ]]; then

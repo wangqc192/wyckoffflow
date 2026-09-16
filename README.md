@@ -132,6 +132,34 @@ If a formula and space group cannot realize the requested complete composition,
 the sampling script reports that pair and skips it while continuing with the
 remaining records.
 
+The default `--decode random` mode keeps the original random flow sampler. For an
+approximate probability-ranked list of unique templates, use beam decoding; set
+`--num_evals` to the requested Top-K and `--beam_size` to the trajectory beam width:
+
+~~~bash
+uv run python scripts/sample_wy.py \
+  --model_path /path/to/checkpoint_or_run \
+  --formula_file example/shotgunII.csv \
+  --num_evals 20 \
+  --decode beam \
+  --beam_size 64 \
+  --save_path outputs/example_beam
+~~~
+
+`--beam_batch_size` (default 512) limits how many beam states are decoded together
+when GPU memory is tight.
+
+**GPU Optimization Note:** Beam sampling now uses an optimized implementation by
+default that provides 2.5-3.5x speedup with 70-85% GPU utilization (vs. 20-30%
+before). To use the original implementation for comparison, add
+`--no-use_optimized_beam`. For details and performance tuning, see
+`QUICK_START_OPTIMIZATION.md`.
+
+Beam scores rank discrete flow trajectories. Since the model predicts all Wyckoff
+variables in parallel, they approximate rather than exactly marginalize the final
+template probability; no checkpoint retraining is required. Extracted beam CSVs
+include `beam_rank` and `beam_score`; these columns are empty for random sampling.
+
 To prepare the full MP20 test split as sampling input, use the conventional CIF
 stored in `cif.conv`; this preserves complete conventional-cell formula counts:
 
@@ -179,6 +207,124 @@ the same output location. The optional positional arguments are `INPUT_CSV`,
 can be reused
 for any Top-K because the Bash argument is passed to
 `sample_wy.py --num_evals` and `eval_gwa.py --top_k`.
+
+## Formula-to-structure generation
+
+Generate concrete CIF and POSCAR candidates directly from one complete chemical
+formula:
+
+~~~bash
+uv run python scripts/generate_structure.py \
+  --formula Ga4Te4 \
+  --flow-checkpoint outputs/<date>/<run>/checkpoints/best.ckpt \
+  --output-dir outputs/formula_generation/Ga4Te4
+~~~
+
+The command runs one integrated chain:
+
+1. the released NextCrystal predictor ranks the Top-K space groups;
+2. this repository samples composition-conserving Wyckoff templates separately
+   under each ranked space group and removes duplicate complete
+   `G-W-A-W-A-...` sequences;
+3. the symmetry-aware model from `/home/wangqc/DiffCSP` expands each template
+   into lattice parameters and fractional coordinates;
+4. the standardized samples are exported to both CIF and POSCAR.
+
+The defaults use these external model assets without copying checkpoints or the
+external repositories into this repository:
+
+- `/home/wangqc/NextCrystal/artifacts/mp_20/spacegroup.ckpt`;
+- the checkpoint supplied through `--flow-checkpoint`;
+- `/home/wangqc/DiffCSP/ckpt/CSP-mp20-sym`, sampled with 100 integration
+  steps, coordinate annealing slope 5, and batch size 50.
+
+Use `--nextcrystal-root`, `--nextcrystal-checkpoint`, `--diffcsp-repo`,
+`--diffcsp-checkpoint`, and `--diffcsp-python` to override those locations.
+`--space-group-top-k`, `--templates-per-space-group`, and
+`--template-pool-size` control the hierarchy. The input is treated as a complete
+conventional-cell composition and is never reduced; for example, `Ga4Te4` stays
+`Ga4Te4` rather than becoming `GaTe`. Some formula/space-group pairs are not
+Wyckoff-realizable, and duplicate templates are removed, so the final candidate
+count can be smaller than `space-group Top-K × templates per space group`.
+
+Use `--prepare-only` to stop after the first two stages. The output directory
+contains:
+
+- `space_groups.csv`: ranked NextCrystal predictions;
+- `templates.csv` and `templates.pt`: selected Wyckoff templates;
+- `run.json`: formula, random seed, checkpoints, backend, and effective sampling
+  parameters needed to reproduce the run;
+- `diffcsp_templates.csv`: DiffCSP's conventional
+  `formula,num_evals,pressure,wyckoff` input representation;
+- `diffcsp_queries.json`: the same templates as structured symmetry queries;
+- `diffcsp_sample.pt`: standardized DiffCSP samples;
+- `structures.csv`, `cif/*.cif`, and `poscar/*.vasp`: indexed final structures.
+
+DiffCSP++ remains available as an alternative backend:
+
+~~~bash
+uv run python scripts/generate_structure.py \
+  --formula Ga4Te4 \
+  --flow-checkpoint outputs/<date>/<run>/checkpoints/best.ckpt \
+  --output-dir outputs/formula_generation/Ga4Te4_diffcsppp \
+  --structure-backend diffcsppp
+~~~
+
+This backend always invokes `scripts/run_nextcrystal_diffcsppp.py sample` with
+`--batch-size 128 --num-shards 4`. All four shards are produced and merged;
+small formula-only jobs therefore include valid empty shard files. Override its
+external assets with `--diffcsppp-repo`, `--diffcsppp-checkpoint`, and
+`--diffcsppp-python`.
+
+Evaluate DiffCSP structures generated from the unique MP20 test Top-20
+templates in two stages. First convert the extracted templates to DiffCSP's
+`wyckoff_info.csv` format while retaining an index manifest:
+
+~~~bash
+uv run python scripts/prepare_diffcsp_templates.py \
+  --input outputs/<run>/mp20_test_set/top-20.csv \
+  --output outputs/<run>/mp20_test_set/diffcsp_top20/wyckoff_info.csv \
+  --manifest outputs/<run>/mp20_test_set/diffcsp_top20/manifest.csv
+~~~
+
+For parallel sampling, `--start-index` and `--limit` can write contiguous input
+shards. Pass the resulting sample `.pt` files to `--samples` in index order.
+
+Generate one structure per unique template with the symmetry-aware DiffCSP
+sampler and the MP20 checkpoint settings (`N=100`, coordinate annealing slope
+5, batch size 50):
+
+~~~bash
+scripts/run_diffcsp_template_shard.sh \
+  /path/to/diffcsp/python \
+  0 \
+  /path/to/DiffCSP/symmetry-worktree \
+  /path/to/DiffCSP/ckpt/CSP-mp20-sym \
+  outputs/<run>/mp20_test_set/diffcsp_top20/wyckoff_info.csv \
+  outputs/<run>/mp20_test_set/diffcsp_top20/samples \
+  outputs/<run>/mp20_test_set/diffcsp_top20/sample.log
+~~~
+
+Evaluate all generated structures against `cif.conv`:
+
+~~~bash
+/path/to/diffcsp/python scripts/eval_diffcsp_templates.py \
+  --samples outputs/<run>/mp20_test_set/diffcsp_top20/samples.pt \
+  --manifest outputs/<run>/mp20_test_set/diffcsp_top20/manifest.csv \
+  --targets data/mp20/test.csv \
+  --diffcsp-scripts /path/to/DiffCSP/scripts \
+  --output outputs/<run>/mp20_test_set/diffcsp_top20/matches.csv \
+  --summary outputs/<run>/mp20_test_set/diffcsp_top20/summary.json \
+  --top-k 20 \
+  --workers 32
+~~~
+
+The reported DiffCSP StructureMatcher Top-20 match rate is material-level: a
+test material is a hit when at least one of its generated unique Top-20
+templates passes DiffCSP's composition and structure validity checks and
+matches. The summary also includes the raw StructureMatcher rate without those
+validity filters. The matcher uses `ltol=0.3`, `stol=0.5`, `angle_tol=10`,
+primitive-cell comparison, and volume scaling.
 
 The three data/mini splits contain the same 64 examples and are intended only
 for pipeline checks; use `data=mini` for that check. The default `data=mp20`

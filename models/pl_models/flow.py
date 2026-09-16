@@ -1,5 +1,7 @@
 """Categorical flow matching for Wyckoff-position generation."""
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch.distributions import Categorical
@@ -159,26 +161,14 @@ class DiscreteFlowModule(OptimizedLightningModule):
     @torch.inference_mode()
     def sample(self, batch, count_conserving=None, flow_steps=None):
         """Sample graphs from formula-conditioned records in ``batch``."""
-        required = ("formula", "num_evals", "space_group")
-        missing = [name for name in required if not hasattr(batch, name)]
-        if missing:
-            raise ValueError(f"sampling batch is missing: {', '.join(missing)}")
 
         batch = batch.to(self.device)
         formulas = batch.formula
         if formulas.ndim == 1:
             formulas = formulas.unsqueeze(0)
         num_evals = int(batch.num_evals.reshape(-1)[0])
-        if num_evals <= 0:
-            raise ValueError("num_evals must be positive")
         space_groups = batch.space_group.reshape(-1)
-        if space_groups.numel() != formulas.shape[0]:
-            raise ValueError("space_group must contain one value per formula")
-        if not torch.all((1 <= space_groups) & (space_groups <= 230)):
-            raise ValueError("space_group must lie in 1..230")
         sample_flow_steps = self.flow_steps if flow_steps is None else int(flow_steps)
-        if sample_flow_steps <= 0:
-            raise ValueError("flow_steps must be positive")
 
         data_t = self._build_source_from_compositions(
             formulas.repeat_interleave(num_evals, dim=0),
