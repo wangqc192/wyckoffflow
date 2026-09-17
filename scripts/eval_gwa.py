@@ -13,10 +13,10 @@ from aviary.wren.data import parse_protostructure_label
 from models.common.lookup_tables import spg_wyckoff_multiplicities
 
 
-def occupancy_key(value: str) -> tuple[str, ...]:
+def occupancy_key(value: object) -> tuple[str, ...]:
     """Canonicalize occupancy component order while preserving every entry."""
 
-    space_group, *entries = value.split("_")
+    space_group, *entries = str(value).split("_")
     return (space_group, *sorted(entries))
 
 
@@ -104,9 +104,7 @@ def main(args) -> None:
         summary_path = Path(args.summary_path)
         summary_path.parent.mkdir(parents=True, exist_ok=True)
         summary = evaluation_summary(details, hits, args.top_k)
-        summary_path.write_text(
-            json.dumps(summary, indent=2) + "\n", encoding="utf-8"
-        )
+        summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
         print(f"Wrote summary to {summary_path}")
 
 

@@ -250,6 +250,7 @@ def main(args: argparse.Namespace) -> None:
         templates_per_space_group=args.templates_per_space_group,
         template_pool_size=args.template_pool_size,
         flow_steps=args.flow_steps,
+        sampling_mode=args.sampling_mode,
     )
     if not rows:
         raise RuntimeError("Wyckoff flow produced no exact-composition templates")
@@ -276,6 +277,7 @@ def main(args: argparse.Namespace) -> None:
         "space_group_top_k": args.space_group_top_k,
         "templates_per_space_group": args.templates_per_space_group,
         "template_pool_size": args.template_pool_size,
+        "sampling_mode": args.sampling_mode,
         "generated_templates": len(rows),
         "structure_backend": args.structure_backend,
         "structure_device": resolve_device(args.diffcsp_device),
@@ -375,6 +377,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--space-group-top-k", type=int, default=5)
     parser.add_argument("--templates-per-space-group", type=int, default=4)
     parser.add_argument("--template-pool-size", type=int, default=16)
+    parser.add_argument(
+        "--sampling-mode",
+        choices=("n-shot", "top-n"),
+        default="n-shot",
+        help="n-shot samples with replacement; top-n returns distinct templates",
+    )
     parser.add_argument("--flow-steps", type=int)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")

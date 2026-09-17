@@ -82,3 +82,45 @@ def test_write_selected_queries_keeps_template_order(tmp_path: Path):
         '[\n  {\n    "spacegroup_number": 1\n  },\n'
         '  {\n    "spacegroup_number": 2\n  }\n]'
     )
+
+
+def test_top_n_batch_preserves_target_groups_and_indices(monkeypatch):
+    records = [
+        {
+            "target_index": 10,
+            "formula": "Ga4Te4",
+            "generated_space_group": 194,
+        },
+        {
+            "target_index": 10,
+            "formula": "Ga4Te4",
+            "generated_space_group": 225,
+        },
+        {
+            "target_index": 20,
+            "formula": "Ga4Te4",
+            "generated_space_group": 194,
+        },
+    ]
+
+    class FakeModel:
+        num_elements = 118
+        max_num_atoms = 8
+
+        def sample_logits(self, batch, *, flow_steps):
+            assert batch.target_index.tolist() == [10, 10, 20]
+            assert batch.sampling_group.tolist() == [0, 1, 2]
+            return batch, None, None
+
+    def fake_decode(data, zero_logits, inf_logits, max_num_atoms, **kwargs):
+        return data.to_data_list(), 3, []
+
+    monkeypatch.setattr(pipeline, "sample_batch_to_compositions", fake_decode)
+    sampled = pipeline._sample_record_batch(
+        FakeModel(), records, 2, flow_steps=1, sampling_mode="top-n"
+    )
+
+    assert [record["target_index"] for record, _ in sampled] == [10, 10, 20]
+    assert [record["generated_space_group"] for record, _ in sampled] == [194, 225, 194]
+    assert [int(samples[0].target_index) for _, samples in sampled] == [10, 10, 20]
+    assert [int(samples[0].sampling_group) for _, samples in sampled] == [0, 1, 2]

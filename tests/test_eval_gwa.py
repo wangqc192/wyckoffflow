@@ -19,6 +19,10 @@ def test_occupancy_key_ignores_order_but_preserves_counts():
     assert occupancy_key("194_Ga2x4f_Te1x4f") != expected
 
 
+def test_occupancy_key_accepts_numeric_csv_values():
+    assert occupancy_key(194) == ("194",)
+
+
 def test_target_occupancy_keys_include_equivalent_settings():
     keys = target_occupancy_keys("AB_oC4_65_a_c:Cu-Ni")
 

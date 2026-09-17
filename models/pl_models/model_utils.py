@@ -6,6 +6,15 @@ from torch_geometric.data import Data
 from ..common import lookup_tables
 
 
+class WyckoffData(Data):
+    """Wyckoff graph with global metadata labels that PyG must not offset."""
+
+    def __inc__(self, key, value, *args, **kwargs):
+        if key in {"target_index", "sampling_group"}:
+            return 0
+        return super().__inc__(key, value, *args, **kwargs)
+
+
 def create_x_matrix(x_inf_dof, x_0_dof, zero_dof):
     x = torch.zeros(
         (x_inf_dof.shape[0] + x_0_dof.shape[0], x_inf_dof.shape[1] + 1),
@@ -35,7 +44,7 @@ def create_wyckoff_graph(space_group, x_0_dof, x_inf_dof):
         list(reversed(multiplicity_values.values())), device=device
     )
 
-    return Data(
+    return WyckoffData(
         x=create_x_matrix(x_inf_dof, x_0_dof, zero_dof),
         edge_index=torch.stack(
             [positions.repeat_interleave(num_pos), positions.repeat(num_pos)]

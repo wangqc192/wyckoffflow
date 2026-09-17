@@ -1,7 +1,5 @@
 """Categorical flow matching for Wyckoff-position generation."""
 
-import math
-
 import torch
 import torch.nn.functional as F
 from torch.distributions import Categorical
@@ -14,7 +12,7 @@ from ..common.dataset_info import (
     MP20_ZERO_DOF_DISTRIBUTION,
 )
 from .base import OptimizedLightningModule
-from .count_conserving import repair_batch_to_compositions
+from .count_conserving import sample_batch_to_compositions
 from .gnn import WyckoffGNN
 from .model_utils import (
     create_wyckoff_graph,
@@ -158,17 +156,13 @@ class DiscreteFlowModule(OptimizedLightningModule):
 
     _mask_training_logits = _mask_logits
 
-    @torch.inference_mode()
-    def sample(self, batch, count_conserving=None, flow_steps=None):
-        """Sample graphs from formula-conditioned records in ``batch``."""
-
+    def _run_flow(self, batch, sample_flow_steps, defer_final_step=False):
         batch = batch.to(self.device)
         formulas = batch.formula
         if formulas.ndim == 1:
             formulas = formulas.unsqueeze(0)
         num_evals = int(batch.num_evals.reshape(-1)[0])
         space_groups = batch.space_group.reshape(-1)
-        sample_flow_steps = self.flow_steps if flow_steps is None else int(flow_steps)
 
         data_t = self._build_source_from_compositions(
             formulas.repeat_interleave(num_evals, dim=0),
@@ -176,6 +170,11 @@ class DiscreteFlowModule(OptimizedLightningModule):
             (
                 batch.target_index.reshape(-1).repeat_interleave(num_evals)
                 if hasattr(batch, "target_index")
+                else None
+            ),
+            (
+                batch.sampling_group.reshape(-1).repeat_interleave(num_evals)
+                if hasattr(batch, "sampling_group")
                 else None
             ),
         )
@@ -192,6 +191,9 @@ class DiscreteFlowModule(OptimizedLightningModule):
                 inf_logits,
                 data_t,
             )
+            if defer_final_step and step == sample_flow_steps - 1:
+                return data_t, zero_logits.detach().cpu(), inf_logits.detach().cpu()
+
             jump_probability = 1 / (sample_flow_steps - step)
             data_t.x_0_dof = categorical_flow_step(
                 data_t.x_0_dof,
@@ -209,21 +211,46 @@ class DiscreteFlowModule(OptimizedLightningModule):
                 data_t.zero_dof,
             )
 
+        return data_t, None, None
+
+    @torch.inference_mode()
+    def sample_logits(self, batch, flow_steps=None):
+        """Run the GPU flow and return the final masked logits for CPU decoding."""
+
+        sample_flow_steps = self.flow_steps if flow_steps is None else int(flow_steps)
+        if sample_flow_steps <= 0:
+            raise ValueError("flow_steps must be positive")
+        return self._run_flow(batch, sample_flow_steps, defer_final_step=True)
+
+    @torch.inference_mode()
+    def sample(self, batch, count_conserving=None, flow_steps=None):
+        """Sample graphs from formula-conditioned records in ``batch``."""
+
         use_count_conserving = (
             self.count_conserving if count_conserving is None else count_conserving
         )
+        sample_flow_steps = self.flow_steps if flow_steps is None else int(flow_steps)
+        if sample_flow_steps <= 0:
+            raise ValueError("flow_steps must be positive")
+
         if use_count_conserving:
-            data_t, _ = repair_batch_to_compositions(
+            data_t, zero_logits, inf_logits = self.sample_logits(
+                batch, sample_flow_steps
+            )
+            data_t, _ = sample_batch_to_compositions(
                 data_t,
                 zero_logits,
                 inf_logits,
                 self.max_num_atoms,
             )
-            data_t.x = create_x_matrix(
-                data_t.x_inf_dof,
-                data_t.x_0_dof,
-                data_t.zero_dof,
-            )
+        else:
+            data_t, _, _ = self._run_flow(batch, sample_flow_steps)
+
+        data_t.x = create_x_matrix(
+            data_t.x_inf_dof,
+            data_t.x_0_dof,
+            data_t.zero_dof,
+        )
         return data_t
 
     def _build_source_from_compositions(
@@ -231,6 +258,7 @@ class DiscreteFlowModule(OptimizedLightningModule):
         compositions,
         fixed_space_group,
         target_indices=None,
+        sampling_groups=None,
     ):
         compositions = compositions.to(self.device)
         if isinstance(fixed_space_group, torch.Tensor):
@@ -247,8 +275,10 @@ class DiscreteFlowModule(OptimizedLightningModule):
         graphs = []
         if target_indices is None:
             target_indices = [None] * compositions.shape[0]
-        for composition, space_group, target_index in zip(
-            compositions, space_groups, target_indices
+        if sampling_groups is None:
+            sampling_groups = [None] * compositions.shape[0]
+        for composition, space_group, target_index, sampling_group in zip(
+            compositions, space_groups, target_indices, sampling_groups
         ):
             space_group = int(space_group)
             degrees = get_degrees_of_freedom(space_group, self.device)
@@ -263,6 +293,12 @@ class DiscreteFlowModule(OptimizedLightningModule):
             if target_index is not None:
                 graph.target_index = torch.as_tensor(
                     target_index,
+                    device=self.device,
+                    dtype=torch.long,
+                )
+            if sampling_group is not None:
+                graph.sampling_group = torch.as_tensor(
+                    sampling_group,
                     device=self.device,
                     dtype=torch.long,
                 )

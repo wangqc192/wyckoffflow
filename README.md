@@ -124,41 +124,53 @@ in the formula CSV.
 `--flow_steps` optionally overrides the checkpoint's inference step count for one
 sampling run. If omitted, the checkpoint value is used and the effective value is
 stored in the output `.pt` file. The Bash pipeline accepts this as its optional
-sixth argument; use a different `RESULT_NAME` for each step-count comparison.
+fourth positional argument; use a different `RESULT_NAME` for each step-count
+comparison.
 
-Sampling enforces the conditioned composition by default. Use
-`--no-count_conserving` to disable this repair step.
-If a formula and space group cannot realize the requested complete composition,
-the sampling script reports that pair and skips it while continuing with the
-remaining records.
+Sampling enforces the conditioned composition by default. With
+`count_conserving` enabled, the GPU phase runs all input batches first and writes one
+intermediate `.logits.pt` payload containing each batch's final masked `zero_logits`
+and `inf_logits`. Only after that file has been completely written does CPU DP begin.
+The decoder processes the saved batches with one shared process pool, uses prefix
+slices instead of repeatedly scanning the full merged graph array, and shows a
+per-graph progress bar. Logit tensors are shared with workers rather than copied once
+per graph. The default is 52 CPU worker processes; override it with
+`--cpu-workers N`. Use `--no-count_conserving` to disable this final
+composition-conserving sampling step. If a formula and space group cannot realize the
+requested complete composition, the sampling script reports that pair and skips it
+while continuing with the remaining records.
 
-The default `--decode random` mode keeps the original random flow sampler. For an
-approximate probability-ranked list of unique templates, use beam decoding; set
-`--num_evals` to the requested Top-K and `--beam_size` to the trajectory beam width:
+There are two sampling modes. The default `n-shot` mode keeps the original
+with-replacement behavior: every target runs the GPU flow `--num_evals` times and
+each final graph is repaired independently with stochastic CPU DP, so duplicate
+templates are allowed. Use `top-n` when every target must produce distinct
+templates:
 
 ~~~bash
-uv run python scripts/sample_wy.py \
-  --model_path /path/to/checkpoint_or_run \
-  --formula_file example/shotgunII.csv \
-  --num_evals 20 \
-  --decode beam \
-  --beam_size 64 \
-  --save_path outputs/example_beam
+scripts/sample_and_eval_gwa.sh \
+  /path/to/checkpoint_or_run \
+  20 \
+  test \
+  --sampling-mode top-n
 ~~~
 
-`--beam_batch_size` (default 512) limits how many beam states are decoded together
-when GPU memory is tight.
+In `top-n` mode each target runs the GPU flow once and saves its final masked
+`zero_logits` and `inf_logits`; after all GPU batches have been saved, CPU DP
+returns up to the requested number of distinct exact-composition templates. The
+decoder expands its fixed-site beam when necessary, and never copies an existing
+template to fill a missing Top-K slot. If the feasible template space is smaller
+than K, the output reports and contains the actual number of unique templates.
+The raw logits and output names include the `-top-n` suffix so they do not collide
+with `n-shot` results. `--topn-beam-size` controls the initial CPU DP beam.
 
-**GPU Optimization Note:** Beam sampling now uses an optimized implementation by
-default that provides 2.5-3.5x speedup with 70-85% GPU utilization (vs. 20-30%
-before). To use the original implementation for comparison, add
-`--no-use_optimized_beam`. For details and performance tuning, see
-`QUICK_START_OPTIMIZATION.md`.
+The equivalent direct entry-point options are `--sampling-mode n-shot` and
+`--sampling-mode top-n`; `--sample-mode` is an accepted alias. Both modes use the
+same exact composition constraint and default to 52 CPU worker processes, which
+can be changed with `--cpu-workers N`.
 
-Beam scores rank discrete flow trajectories. Since the model predicts all Wyckoff
-variables in parallel, they approximate rather than exactly marginalize the final
-template probability; no checkpoint retraining is required. Extracted beam CSVs
-include `beam_rank` and `beam_score`; these columns are empty for random sampling.
+Top-N ranking is performed by the CPU dynamic program over the final masked logits.
+It ranks complete exact-composition assignments rather than independently ranking
+Wyckoff variables, so every returned candidate is a valid complete template.
 
 To prepare the full MP20 test split as sampling input, use the conventional CIF
 stored in `cif.conv`; this preserves complete conventional-cell formula counts:
@@ -202,11 +214,32 @@ generated templates to the corresponding `.csv`, and the per-target evaluation
 to `top-20_flow_steps-100_gwa.csv`. The G-W-A Top-K match-rate summary is written
 to `top-20_flow_steps-100_gwa.json` in the same folder, including the matched and
 total material counts. Passing the training run directory instead of a checkpoint uses
-the same output location. The optional positional arguments are `INPUT_CSV`,
-`TARGET_CSV`, and `FLOW_STEPS`, in that order. The same `example/input_test.csv`
-can be reused
-for any Top-K because the Bash argument is passed to
+the same output location. The optional positional arguments are `FLOW_STEPS`,
+`INPUT_CSV`, and `TARGET_CSV`, in that order. The same `example/input_test.csv`
+can be reused for any Top-K because the Bash argument is passed to
 `sample_wy.py --num_evals` and `eval_gwa.py --top_k`.
+
+To skip GPU flow and reuse the matching
+`top-<K>_flow_steps-<N>.logits.pt` already present in the result folder, append
+`--reuse-logits`:
+
+~~~bash
+scripts/sample_and_eval_gwa.sh \
+  outputs/2026-09-10/10-27-26_discrete_flow/checkpoints/best.ckpt \
+  1 \
+  mp20_test_set \
+  1 \
+  --reuse-logits
+~~~
+
+The pipeline finds the logits file from `NUM_EVALS` and `FLOW_STEPS`, skips model
+loading and GPU inference, reruns only CPU DP repair, then extracts the corrected
+CSV and evaluates it. If `FLOW_STEPS` is omitted and exactly one matching Top-K
+logits file exists in the result folder, that file is selected automatically. If
+multiple matching files exist, pass `FLOW_STEPS` to select one. The alias
+`--skip-sample-logits` has the same behavior. CPU repair uses 52 workers by default;
+for example, append `--cpu-workers 32` to use 32 processes. The flag applies both to
+fresh sampling and `--reuse-logits` runs.
 
 ## Formula-to-structure generation
 
@@ -222,10 +255,14 @@ uv run python scripts/generate_structure.py \
 
 The command runs one integrated chain:
 
-1. the released NextCrystal predictor ranks the Top-K space groups;
+1. the released NextCrystal predictor masks space groups whose Wyckoff
+   multiplicities cannot realize the requested complete composition, then ranks
+   the remaining Space-group Top-K;
 2. this repository samples composition-conserving Wyckoff templates separately
    under each ranked space group and removes duplicate complete
-   `G-W-A-W-A-...` sequences;
+   `G-W-A-W-A-...` sequences. The default is `n-shot`; pass
+   `--sampling-mode top-n` to run one GPU flow per space-group condition and
+   obtain distinct CPU-DP candidates without replacement;
 3. the symmetry-aware model from `/home/wangqc/DiffCSP` expands each template
    into lattice parameters and fractional coordinates;
 4. the standardized samples are exported to both CIF and POSCAR.
@@ -245,7 +282,8 @@ Use `--nextcrystal-root`, `--nextcrystal-checkpoint`, `--diffcsp-repo`,
 conventional-cell composition and is never reduced; for example, `Ga4Te4` stays
 `Ga4Te4` rather than becoming `GaTe`. Some formula/space-group pairs are not
 Wyckoff-realizable, and duplicate templates are removed, so the final candidate
-count can be smaller than `space-group Top-K × templates per space group`.
+count can be smaller than `space-group Top-K × templates per space group`; neither
+sampling mode pads the result by repeating a template.
 
 Use `--prepare-only` to stop after the first two stages. The output directory
 contains:
