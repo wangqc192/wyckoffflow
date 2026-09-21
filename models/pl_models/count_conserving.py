@@ -502,6 +502,33 @@ def cpu_dp_pool(cpu_workers, num_graphs):
         yield executor, worker_count
 
 
+def _candidate_probability(
+    zero_logits,
+    inf_logits,
+    target_composition,
+    decoded_zero,
+    decoded_inf,
+):
+    """Return the model probability of one decoded template."""
+    zero_log_probability = torch.log_softmax(zero_logits, dim=-1).gather(
+        1, decoded_zero.long().unsqueeze(-1)
+    ).sum()
+
+    elements = torch.nonzero(target_composition[1:] > 0).flatten()
+    if elements.numel():
+        element_logits = inf_logits[:, elements, :]
+        element_counts = decoded_inf[:, elements].long().unsqueeze(-1)
+        variable_log_probability = torch.log_softmax(
+            element_logits, dim=-1
+        ).gather(-1, element_counts).sum()
+    else:
+        variable_log_probability = zero_log_probability.new_zeros(())
+
+    return float(
+        torch.exp(zero_log_probability + variable_log_probability).item()
+    )
+
+
 def _decode_single_task(
     zero_logits,
     inf_logits,
@@ -557,7 +584,17 @@ def _decode_single_task(
             raise
         return graph_index, None
     return graph_index, [
-        (decoded_zero.numpy(), decoded_inf.numpy())
+        (
+            decoded_zero.numpy(),
+            decoded_inf.numpy(),
+            _candidate_probability(
+                zero_logits[zero_start:zero_stop],
+                inf_logits[inf_start:inf_stop],
+                target_composition,
+                decoded_zero,
+                decoded_inf,
+            ),
+        )
         for decoded_zero, decoded_inf in decoded
     ]
 
@@ -727,9 +764,15 @@ def _decode_graphs(
             for graph_index, decoded in decoded_chunk:
                 if decoded is None:
                     infeasible_graph_indices.append(graph_index)
+                    if progress is not None and hasattr(progress, "set_postfix"):
+                        progress.set_postfix(
+                            graph=graph_index,
+                            template_rank="infeasible",
+                            refresh=False,
+                        )
                     continue
                 if candidate_count is None:
-                    decoded_zero, decoded_inf = decoded[0]
+                    decoded_zero, decoded_inf = decoded[0][:2]
                     zero_start = int(zero_offsets[graph_index])
                     zero_stop = int(zero_offsets[graph_index + 1])
                     inf_start = int(inf_offsets[graph_index])
@@ -738,6 +781,20 @@ def _decode_graphs(
                     repaired_inf[inf_start:inf_stop] = torch.from_numpy(decoded_inf)
                 else:
                     candidate_results[graph_index] = decoded
+                if progress is not None and hasattr(progress, "set_postfix"):
+                    rank = len(decoded) if candidate_count is not None else 1
+                    requested = candidate_count if candidate_count is not None else 1
+                    probability = decoded[-1][2] if decoded else None
+                    progress.set_postfix(
+                        graph=graph_index,
+                        template_rank=f"{rank}/{requested}",
+                        probability=(
+                            f"{probability:.3e}"
+                            if probability is not None
+                            else "n/a"
+                        ),
+                        refresh=False,
+                    )
             if progress is not None:
                 progress.update(len(decoded_chunk))
 
@@ -786,7 +843,9 @@ def _candidate_data_list(data, candidate_results):
         else:
             group = graph_index
         seen = seen_by_group.setdefault(group, set())
-        for decoded_zero, decoded_inf in candidate_results[graph_index]:
+        for candidate in candidate_results[graph_index]:
+            decoded_zero, decoded_inf = candidate[:2]
+            candidate_probability = candidate[2] if len(candidate) > 2 else None
             signature = (decoded_zero.tobytes(), decoded_inf.tobytes())
             if signature in seen:
                 continue
@@ -803,6 +862,15 @@ def _candidate_data_list(data, candidate_results):
                 graph_copy.x_0_dof,
                 graph_copy.zero_dof,
             )
+            graph_copy.candidate_rank = torch.tensor(
+                len(seen), dtype=torch.long, device=graph_copy.x.device
+            )
+            if candidate_probability is not None:
+                graph_copy.candidate_probability = torch.tensor(
+                    candidate_probability,
+                    dtype=torch.float64,
+                    device=graph_copy.x.device,
+                )
             samples.append(graph_copy)
     return samples
 

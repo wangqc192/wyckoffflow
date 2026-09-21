@@ -207,8 +207,13 @@ def test_top_n_does_not_deduplicate_different_target_groups():
 
     samples = _candidate_data_list(
         batch,
-        {0: [(decoded_zero, decoded_inf)], 1: [(decoded_zero, decoded_inf)]},
+        {
+            0: [(decoded_zero, decoded_inf, 0.25)],
+            1: [(decoded_zero, decoded_inf, 0.5)],
+        },
     )
 
     assert len(samples) == 2
     assert [int(sample.target_index) for sample in samples] == [10, 20]
+    assert [int(sample.candidate_rank) for sample in samples] == [1, 1]
+    assert [float(sample.candidate_probability) for sample in samples] == [0.25, 0.5]

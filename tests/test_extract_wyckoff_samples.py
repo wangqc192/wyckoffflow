@@ -31,6 +31,7 @@ def test_extract_samples_keeps_duplicate_occupancies(tmp_path):
     assert len(rows) == 2
     assert [row["sample_index"] for row in rows] == [0, 1]
     assert [row["target_index"] for row in rows] == [0, 0]
+    assert [row["candidate_rank"] for row in rows] == [1, 2]
     assert [row["wyckoff_occupancy"] for row in rows] == [
         "1_Si1x1a",
         "1_Si1x1a",

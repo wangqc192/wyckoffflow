@@ -85,10 +85,22 @@ def extract_samples(
             if hasattr(sample, "target_index")
             else index // top_k
         )
+        candidate_rank = (
+            _scalar(sample.candidate_rank)
+            if hasattr(sample, "candidate_rank")
+            else index % top_k + 1
+        )
+        candidate_probability = (
+            float(sample.candidate_probability.reshape(-1)[0].item())
+            if hasattr(sample, "candidate_probability")
+            else None
+        )
         rows.append(
             {
                 "sample_index": index,
                 "target_index": target_index,
+                "candidate_rank": candidate_rank,
+                "candidate_probability": candidate_probability,
                 **_decode_sample(sample),
                 "count": 1,
             }
@@ -100,6 +112,8 @@ def write_csv(rows: list[dict[str, object]], output_path: str | Path) -> None:
     fieldnames = [
         "sample_index",
         "target_index",
+        "candidate_rank",
+        "candidate_probability",
         "space_group",
         "formula",
         "target_formula",
