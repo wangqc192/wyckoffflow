@@ -226,7 +226,7 @@ def prepare(args: argparse.Namespace) -> None:
     print(f"selected JSON: {args.selected_json}")
 
 
-def configure_diffcsp_imports(repo_path: Path) -> None:
+def configure_diffcsppp_imports(repo_path: Path) -> None:
     repo_path = repo_path.resolve()
     os.environ.setdefault("PROJECT_ROOT", str(repo_path))
     os.environ.setdefault("HYDRA_JOBS", "/tmp/diffcsppp_hydra")
@@ -237,7 +237,7 @@ def configure_diffcsp_imports(repo_path: Path) -> None:
 
 
 def load_model_compat(checkpoint_dir: Path, repo_path: Path, device: torch.device):
-    configure_diffcsp_imports(repo_path)
+    configure_diffcsppp_imports(repo_path)
     import hydra
     from hydra import compose, initialize_config_dir
 
@@ -298,7 +298,7 @@ def sample(args: argparse.Namespace) -> None:
     if args.batch_size != 128 or args.num_shards != 4:
         raise ValueError("DiffCSP++ sampling requires --batch-size 128 --num-shards 4")
     # Hydra initialization in DiffCSP++ may change cwd; anchor all paths first.
-    args.diffcsp_repo = args.diffcsp_repo.resolve()
+    args.diffcsppp_repo = args.diffcsppp_repo.resolve()
     args.checkpoint_dir = args.checkpoint_dir.resolve()
     args.selected_json = args.selected_json.resolve()
     args.output = args.output.resolve()
@@ -333,7 +333,7 @@ def sample(args: argparse.Namespace) -> None:
         print(f"saved empty shard: {args.output}")
         return
 
-    configure_diffcsp_imports(args.diffcsp_repo)
+    configure_diffcsppp_imports(args.diffcsppp_repo)
     import diffcsp.pl_modules.diffusion as diffusion_module
     from eval_utils import lattices_to_params_shape
     from sample_api import CustomDataset, get_data_from_syminfo
@@ -356,7 +356,7 @@ def sample(args: argparse.Namespace) -> None:
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed + args.shard_index)
     model, checkpoint_path = load_model_compat(
-        args.checkpoint_dir, args.diffcsp_repo, device
+        args.checkpoint_dir, args.diffcsppp_repo, device
     )
     diffusion_module.tqdm = lambda iterable, *unused_args, **unused_kwargs: iterable
 
@@ -450,10 +450,10 @@ _SMACT_VALIDITY = None
 
 
 def initialize_match_worker(
-    diffcsp_repo: str, stol: float, angle_tol: float, ltol: float
+    diffcsppp_repo: str, stol: float, angle_tol: float, ltol: float
 ) -> None:
     global _MATCHER, _SMACT_VALIDITY
-    configure_diffcsp_imports(Path(diffcsp_repo))
+    configure_diffcsppp_imports(Path(diffcsppp_repo))
     from eval_utils import smact_validity
 
     _MATCHER = StructureMatcher(stol=stol, angle_tol=angle_tol, ltol=ltol)
@@ -616,7 +616,7 @@ def evaluate(args: argparse.Namespace) -> None:
     with concurrent.futures.ProcessPoolExecutor(
         max_workers=args.workers,
         initializer=initialize_match_worker,
-        initargs=(str(args.diffcsp_repo), args.stol, args.angle_tol, args.ltol),
+        initargs=(str(args.diffcsppp_repo), args.stol, args.angle_tol, args.ltol),
     ) as executor:
         results = executor.map(evaluate_material_task, tasks, chunksize=8)
         for completed, result in enumerate(results, start=1):
@@ -717,7 +717,14 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_parser.set_defaults(func=prepare)
 
     sample_parser = subparsers.add_parser("sample")
-    sample_parser.add_argument("--diffcsp-repo", type=Path, required=True)
+    sample_parser.add_argument(
+        "--diffcsppp-repo",
+        "--diffcsp-repo",
+        dest="diffcsppp_repo",
+        type=Path,
+        required=True,
+        help="DiffCSP++ repository path (the old --diffcsp-repo alias is accepted)",
+    )
     sample_parser.add_argument("--checkpoint-dir", type=Path, required=True)
     sample_parser.add_argument("--selected-json", type=Path, required=True)
     sample_parser.add_argument("--output", type=Path, required=True)
@@ -731,7 +738,14 @@ def build_parser() -> argparse.ArgumentParser:
     sample_parser.set_defaults(func=sample)
 
     evaluate_parser = subparsers.add_parser("evaluate")
-    evaluate_parser.add_argument("--diffcsp-repo", type=Path, required=True)
+    evaluate_parser.add_argument(
+        "--diffcsppp-repo",
+        "--diffcsp-repo",
+        dest="diffcsppp_repo",
+        type=Path,
+        required=True,
+        help="DiffCSP++ repository path (the old --diffcsp-repo alias is accepted)",
+    )
     evaluate_parser.add_argument("--manifest-csv", type=Path, required=True)
     evaluate_parser.add_argument("--test-csv", type=Path, required=True)
     evaluate_parser.add_argument("--sample-files", type=Path, nargs="+", required=True)

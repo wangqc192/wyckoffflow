@@ -1,4 +1,4 @@
-"""Convert extracted Wyckoff templates to DiffCSP symmetry-sampling input."""
+"""Convert extracted Wyckoff templates to CrystalFlow input."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ def prepare_templates(
         templates = templates.iloc[:limit]
     templates = templates.copy()
     if not templates["formula"].eq(templates["target_formula"]).all():
-        raise ValueError("DiffCSP input requires composition-conserving templates")
+        raise ValueError("CrystalFlow input requires composition-conserving templates")
 
     manifest = templates.rename(columns={"wyckoff_occupancy": "wyckoff"}).copy()
     manifest.insert(0, "diffcsp_index", manifest.index)

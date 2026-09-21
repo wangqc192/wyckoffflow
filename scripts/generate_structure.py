@@ -4,7 +4,8 @@
 Stages:
 1. NextCrystal predicts Top-K space groups.
 2. This repository's Wyckoff flow samples exact-composition templates.
-3. DiffCSP expands every symmetry template into a concrete structure.
+3. The selected structure backend expands every symmetry template into a concrete structure:
+   CrystalFlow uses the ``diffcsp`` files; DiffCSP++ uses the ``diffcsppp`` files.
 
 The default paths match the local repositories used to develop this pipeline,
 but every external repository/checkpoint can be overridden from the command line.
@@ -66,7 +67,7 @@ def write_diffcsp_template_csv(rows: list[dict[str, Any]], path: Path) -> None:
 
 
 def load_structure_records(sample_paths: list[Path]) -> dict[int, dict[str, Any]]:
-    """Load standardized DiffCSP/DiffCSP++ sample payloads by input index."""
+    """Load standardized ``diffcsp``/``diffcsppp`` payloads by input index."""
 
     records: dict[int, dict[str, Any]] = {}
     for sample_path in sample_paths:
@@ -154,7 +155,7 @@ def run_diffcsp(
     sample_path = output_dir / "diffcsp_sample.pt"
     command = [
         str(args.diffcsp_python),
-        str(Path(__file__).with_name("run_diffcsp_symmetry.py")),
+        str(Path(__file__).with_name("run_crystalflow_symmetry.py")),
         "--diffcsp-repo",
         str(args.diffcsp_repo),
         "--checkpoint-dir",
@@ -191,7 +192,7 @@ def run_diffcsppp(
             str(args.diffcsppp_python),
             str(Path(__file__).with_name("run_nextcrystal_diffcsppp.py")),
             "sample",
-            "--diffcsp-repo",
+            "--diffcsppp-repo",
             str(args.diffcsppp_repo),
             "--checkpoint-dir",
             str(args.diffcsppp_checkpoint),
@@ -312,10 +313,10 @@ def main(args: argparse.Namespace) -> None:
         return
 
     if args.structure_backend == "diffcsp":
-        print("[3/3] DiffCSP symmetry-constrained structure generation", flush=True)
+        print("[3/3] CrystalFlow structure generation", flush=True)
         sample_paths = run_diffcsp(args, selected_json, output_dir)
     else:
-        print("[3/3] DiffCSP++ symmetry-constrained structure generation", flush=True)
+        print("[3/3] DiffCSP++ structure generation", flush=True)
         sample_paths = run_diffcsppp(args, selected_json, output_dir)
     count = write_structure_files(sample_paths, templates_csv, output_dir)
     print(f"Generated {count} structures in {output_dir}")
@@ -356,7 +357,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("/home/wangqc/miniconda3/envs/crystalflow/bin/python"),
     )
-    parser.add_argument("--diffcsp-batch-size", type=int, default=50)
+    parser.add_argument("--diffcsp-batch-size", type=int, default=128)
     parser.add_argument("--diffcsp-ode-int-steps", type=int, default=100)
     parser.add_argument("--diffcsp-anneal-slope", type=float, default=5.0)
     parser.add_argument(

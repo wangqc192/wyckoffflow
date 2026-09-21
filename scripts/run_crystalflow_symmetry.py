@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate concrete structures with DiffCSP's symmetry-aware CSP model.
+"""Generate CrystalFlow structures with DiffCSP's symmetry-aware CSP model.
 
 This runner carries the symmetry-template parsing and ``SymData`` construction
 used by ``/home/wangqc/DiffCSP`` into this repository. DiffCSP model code and
@@ -260,7 +260,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--selected-json", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--batch-size", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--ode-int-steps", type=int, default=100)
     parser.add_argument("--anneal-slope", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=42)

@@ -3,8 +3,8 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT_PATH = Path(__file__).parents[1] / "scripts" / "run_diffcsp_symmetry.py"
-SPEC = importlib.util.spec_from_file_location("run_diffcsp_symmetry", SCRIPT_PATH)
+SCRIPT_PATH = Path(__file__).parents[1] / "scripts" / "run_crystalflow_symmetry.py"
+SPEC = importlib.util.spec_from_file_location("run_crystalflow_symmetry", SCRIPT_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(MODULE)

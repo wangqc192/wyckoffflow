@@ -42,7 +42,7 @@ def test_empty_four_way_shard_writes_standard_payload(tmp_path: Path):
     args = argparse.Namespace(
         batch_size=128,
         num_shards=4,
-        diffcsp_repo=tmp_path / "repo",
+        diffcsppp_repo=tmp_path / "repo",
         checkpoint_dir=tmp_path / "checkpoint",
         selected_json=selected_json,
         output=output,

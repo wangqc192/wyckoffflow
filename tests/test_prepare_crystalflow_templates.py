@@ -1,6 +1,6 @@
 import pandas as pd
 
-from scripts.prepare_diffcsp_templates import prepare_templates
+from scripts.prepare_crystalflow_templates import prepare_templates
 
 
 def test_prepare_templates_slices_rows_and_preserves_global_indices(tmp_path):

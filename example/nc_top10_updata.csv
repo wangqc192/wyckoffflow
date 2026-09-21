@@ -1,4 +1,4 @@
-cif_name,pretty_formula,NAtoms,Spacegroup Symbol,space_group,SG_Prob,SG_Rank,formula
+target_index,pretty_formula,NAtoms,Spacegroup Symbol,space_group,SG_Prob,SG_Rank,formula
 0,GaTe,8,F-43m,216,0.9935606718063354,1,Ga4Te4
 0,GaTe,8,Fm-3m,225,0.0059257079847157,2,Ga4Te4
 0,GaTe,8,P-43m,215,0.0002489824837539,3,Ga4Te4

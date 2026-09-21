@@ -21,12 +21,8 @@ from torch_geometric.data import Batch, Data
 
 from models.common.checkpoint import load_model
 from models.common.composition import formula_to_counts
-from models.common.lookup_tables import chemical_symbols, spg_wyckoff_multiplicities
-from models.common.wyckoff import (
-    decode_wyckoff_elements,
-    query_from_gwa_sequence,
-    wyckoff_multiplicity,
-)
+from models.common.lookup_tables import chemical_symbols
+from models.common.wyckoff_template import WyckoffTemplate
 from models.pl_models.count_conserving import (
     formula_supported_by_space_group,
     sample_batch_to_compositions,
@@ -84,54 +80,23 @@ def complete_formula_from_cif(cif: str) -> str:
 def structure_sequence(data: Data) -> str:
     """Return a graph as the complete ``G-W-A-W-A-…`` sequence."""
 
-    elements, labels = decode_wyckoff_elements(data.x)
-    space_group = int(data.space_group.reshape(-1)[0])
-    multiplicities = spg_wyckoff_multiplicities[str(space_group)]
-    tokens = [str(space_group)]
-    for element, label in zip(elements, labels):
-        tokens.extend((f"{multiplicities[label]}{label}", element))
-    return "-".join(tokens)
+    return WyckoffTemplate.from_model_output(data).to_gwa()
 
 
 def exact_counts_from_sequence(sequence: str) -> dict[str, int]:
-    query = query_from_gwa_sequence(sequence)
-    counts: Counter[str] = Counter()
-    for label, element in zip(query["wyckoff_letters"], query["atom_types"]):
-        counts[element] += wyckoff_multiplicity(label)
-    return dict(counts)
+    return WyckoffTemplate.from_gwa(sequence).formula_counts
 
 
 def wyckoff_template_from_sequence(sequence: str) -> str:
-    """Convert ``G-W-A-…`` into DiffCSP's ``G_A1x1a_…`` format.
+    """Convert ``G-W-A-…`` to CrystalFlow's ``G_A1x1a_…`` format."""
 
-    Repeated identical ``(element, orbit)`` tokens are combined into the
-    occupation integer expected by the symmetry-aware DiffCSP input parser.
-    """
-
-    query = query_from_gwa_sequence(sequence)
-    grouped: dict[tuple[str, str], int] = {}
-    order: list[tuple[str, str]] = []
-    for label, element in zip(query["wyckoff_letters"], query["atom_types"]):
-        key = (element, label)
-        if key not in grouped:
-            order.append(key)
-            grouped[key] = 0
-        grouped[key] += 1
-    orbits = [
-        f"{element}{grouped[(element, label)]}x{label}" for element, label in order
-    ]
-    return "_".join([str(query["spacegroup_number"]), *orbits])
+    return WyckoffTemplate.from_gwa(sequence).to_crystalflow()
 
 
 def query_from_sequence(sequence: str) -> dict[str, Any]:
-    """Return the API query used by DiffCSP-PP for one Wyckoff sequence."""
+    """Return the API query used by DiffCSP++ (``diffcsppp``)."""
 
-    query = query_from_gwa_sequence(sequence)
-    return {
-        "spacegroup_number": int(query["spacegroup_number"]),
-        "wyckoff_letters": list(query["wyckoff_letters"]),
-        "atom_types": list(query["atom_types"]),
-    }
+    return WyckoffTemplate.from_gwa(sequence).to_diffcsppp_query()
 
 
 def _sample_one_space_group(

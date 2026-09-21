@@ -5,37 +5,29 @@ from __future__ import annotations
 import argparse
 import json
 from collections import defaultdict
+from numbers import Number
 from pathlib import Path
 
 import pandas as pd
-from aviary.wren.data import parse_protostructure_label
 
-from models.common.lookup_tables import spg_wyckoff_multiplicities
+from models.common.wyckoff_template import WyckoffTemplate
 
 
 def occupancy_key(value: object) -> tuple[str, ...]:
-    """Canonicalize occupancy component order while preserving every entry."""
+    """Return the canonical key for one generated template."""
 
-    space_group, *entries = str(value).split("_")
-    return (space_group, *sorted(entries))
+    if isinstance(value, Number) and not isinstance(value, bool):
+        return (str(int(value)),)
+    return WyckoffTemplate.from_crystalflow(str(value)).occupancy_key()
 
 
 def target_occupancy_keys(protostructure: str) -> set[tuple[str, ...]]:
-    """Return all symmetry-equivalent occupancy keys for one MP20 record."""
+    """Return canonical keys for all equivalent target Wyckoff settings."""
 
-    space_group, _, elements, wyckoff_sets = parse_protostructure_label(protostructure)
-    multiplicities = spg_wyckoff_multiplicities[str(space_group)]
-    keys = set()
-    for wyckoff_set in wyckoff_sets:
-        occupancy = defaultdict(int)
-        for element, letter in zip(elements, wyckoff_set):
-            occupancy[(element, letter)] += 1
-        entries = [
-            f"{element}{count}x{multiplicities[letter]}{letter}"
-            for (element, letter), count in occupancy.items()
-        ]
-        keys.add(occupancy_key("_".join([str(space_group), *entries])))
-    return keys
+    return {
+        template.occupancy_key()
+        for template in WyckoffTemplate.from_protostructure_set(protostructure)
+    }
 
 
 def evaluate(target_df: pd.DataFrame, generated_df: pd.DataFrame, top_k: int):
