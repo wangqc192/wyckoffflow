@@ -45,6 +45,11 @@ class DiscreteFlowModule(OptimizedLightningModule):
         self.max_num_atoms = config["max_num_atoms"]
         self.flow_steps = config["flow_steps"]
         self.count_conserving = config.get("count_conserving", False)
+        loss_weights = config.get("loss_weights", {})
+        self.zero_df_loss_weight = float(loss_weights.get("zero_df", 1.0))
+        self.inf_df_loss_weight = float(loss_weights.get("inf_df", 1.0))
+        if self.zero_df_loss_weight < 0 or self.inf_df_loss_weight < 0:
+            raise ValueError("loss weights must be non-negative")
         if not config["conditional_composition"]:
             raise ValueError("DiscreteFlowModule requires conditional_composition=True")
 
@@ -127,7 +132,10 @@ class DiscreteFlowModule(OptimizedLightningModule):
         inf_loss = (inf_loss / variables_per_graph).mean()
 
         return {
-            "loss": zero_loss + inf_loss,
+            "loss": (
+                self.zero_df_loss_weight * zero_loss
+                + self.inf_df_loss_weight * inf_loss
+            ),
             "zero_df_loss": zero_loss,
             "inf_df_loss": inf_loss,
         }

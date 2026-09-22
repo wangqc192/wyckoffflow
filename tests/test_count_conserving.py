@@ -10,7 +10,11 @@ import scripts.sample_wy as sample_wy
 from models.common.composition import formula_to_counts
 from models.pl_models.count_conserving import _graph_offsets, cpu_dp_worker_count
 from models.pl_models.flow import DiscreteFlowModule
-from models.pl_models.model_utils import create_x_matrix
+from models.pl_models.model_utils import (
+    create_wyckoff_graph,
+    create_x_matrix,
+    get_degrees_of_freedom,
+)
 from scripts.sample_wy import (
     SampleDataset,
     flow_logits,
@@ -40,6 +44,43 @@ MODEL_CONFIG = {
     "mlp_hidden_layers": 1,
     "mlp_activation": "SiLU",
 }
+
+
+def test_loss_weights_control_flow_loss():
+    degrees = get_degrees_of_freedom(194)
+    graph = create_wyckoff_graph(
+        194,
+        torch.zeros(int((degrees == 0).sum()), dtype=torch.long),
+        torch.zeros(int((degrees != 0).sum()), 118, dtype=torch.long),
+    )
+    graph.composition = formula_to_counts("Ga4Te4", 118).unsqueeze(0)
+    batch = Batch.from_data_list([graph])
+
+    base_config = {
+        **MODEL_CONFIG,
+        "loss_weights": {"zero_df": 1.0, "inf_df": 1.0},
+    }
+    weighted_config = {
+        **MODEL_CONFIG,
+        "loss_weights": {"zero_df": 2.0, "inf_df": 3.0},
+    }
+    base_model = DiscreteFlowModule(base_config, OPTIMIZER_CONFIG).eval()
+    weighted_model = DiscreteFlowModule(weighted_config, OPTIMIZER_CONFIG).eval()
+    weighted_model.load_state_dict(base_model.state_dict())
+
+    torch.manual_seed(7)
+    base_losses = base_model(batch)
+    torch.manual_seed(7)
+    weighted_losses = weighted_model(batch)
+
+    assert torch.allclose(
+        weighted_losses["zero_df_loss"], base_losses["zero_df_loss"]
+    )
+    assert torch.allclose(weighted_losses["inf_df_loss"], base_losses["inf_df_loss"])
+    assert torch.allclose(
+        weighted_losses["loss"],
+        2 * base_losses["zero_df_loss"] + 3 * base_losses["inf_df_loss"],
+    )
 
 
 def test_sample_uses_final_logits_for_exact_composition():

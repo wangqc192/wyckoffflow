@@ -8,4 +8,4 @@ datamodule:
     train: 256
     val: 256
     test: 256
-  prototype_sampling_alpha: 0.25
+  prototype_sampling_alpha: 0.0

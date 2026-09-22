@@ -1,6 +1,6 @@
 root_path: ${hydra:runtime.cwd}/data/mp20
 dataset_name: mp20
-num_elements: 118
+num_elements: 100
 
 datamodule:
   _target_: models.pl_data.datamodule.CrystDataModule
