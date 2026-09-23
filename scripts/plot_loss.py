@@ -9,6 +9,10 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 import pandas as pd
+import scienceplots
+
+plt.style.use(["ieee", "science"])
+
 
 
 def logged_values(metrics, x_column, loss_column):
@@ -24,11 +28,9 @@ def main():
 
     metrics_path = args.path / "logs/metrics.csv" if args.path.is_dir() else args.path
     metrics = pd.read_csv(metrics_path)
-    epoch_loss = (
-        "train/loss_epoch" in metrics and metrics["train/loss_epoch"].notna().any()
-    )
-    x_column = "epoch" if epoch_loss else "step"
-    train_suffix = "epoch" if epoch_loss else "step"
+    
+    x_column = "epoch"
+    train_suffix = "epoch"
 
     figure, axes = plt.subplots(1, 2, figsize=(12, 5))
     components_axis, total_axis = axes
@@ -39,25 +41,23 @@ def main():
     }
     for component, (label, color) in component_styles.items():
         train_column = f"train/{component}_{train_suffix}"
-        if train_column in metrics and metrics[train_column].notna().any():
-            train = logged_values(metrics, x_column, train_column)
-            components_axis.plot(
-                train[x_column],
-                train[train_column],
-                label=f"Train {label}",
-                color=color,
-            )
+        train = logged_values(metrics, x_column, train_column)
+        components_axis.plot(
+            train[x_column],
+            train[train_column],
+            label=f"Train {label}",
+            color=color,
+        )
 
         validation_column = f"val/{component}"
-        if validation_column in metrics and metrics[validation_column].notna().any():
-            validation = logged_values(metrics, x_column, validation_column)
-            components_axis.plot(
-                validation[x_column],
-                validation[validation_column],
-                label=f"Validation {label}",
-                color=color,
-                linestyle="--",
-            )
+        validation = logged_values(metrics, x_column, validation_column)
+        components_axis.plot(
+            validation[x_column],
+            validation[validation_column],
+            label=f"Validation {label}",
+            color=color,
+            linestyle="--",
+        )
 
     train_column = f"train/loss_{train_suffix}"
     train = logged_values(metrics, x_column, train_column)
@@ -67,14 +67,13 @@ def main():
         label="Train",
         color="#2563eb",
     )
-    if "val/loss" in metrics and metrics["val/loss"].notna().any():
-        validation = logged_values(metrics, x_column, "val/loss")
-        total_axis.plot(
-            validation[x_column],
-            validation["val/loss"],
-            label="Validation",
-            color="#dc2626",
-        )
+    validation = logged_values(metrics, x_column, "val/loss")
+    total_axis.plot(
+        validation[x_column],
+        validation["val/loss"],
+        label="Validation",
+        color="#dc2626",
+    )
 
     for axis, title in zip(axes, ("Loss components", "Total loss")):
         axis.set_title(title)
@@ -82,6 +81,7 @@ def main():
         axis.set_ylabel("Loss")
         axis.grid(alpha=0.25)
         axis.legend()
+    axes[0].set_ylim(0, 0.5)
     figure.tight_layout()
 
     output = args.output or metrics_path.with_name("loss.png")
