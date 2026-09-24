@@ -1,0 +1,10 @@
+_target_: models.pl_models.crystal_gnn.CrystalGNN
+
+hidden_dim: 256
+element_dim: 128
+num_gnn_layers: 4
+num_heads: 8
+dropout: 0.1
+use_symmetry_features: true
+use_composition_residual: true
+use_edge_bias: true

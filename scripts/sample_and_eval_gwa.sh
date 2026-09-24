@@ -6,12 +6,17 @@ reuse_logits=false
 cpu_workers=52
 sampling_mode=
 sampling_mode_explicit=false
-topn_beam_size=
+fixed_site_beam_size=
+composition_args=()
 positional=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --reuse-logits|--skip-sample-logits)
             reuse_logits=true
+            shift
+            ;;
+        --enforce-composition|--no-enforce-composition)
+            composition_args=("$1")
             shift
             ;;
         --cpu-workers)
@@ -32,12 +37,12 @@ while [[ $# -gt 0 ]]; do
             sampling_mode_explicit=true
             shift
             ;;
-        --topn-beam-size)
-            topn_beam_size=$2
+        --fixed-site-beam-size|--topn-beam-size)
+            fixed_site_beam_size=$2
             shift 2
             ;;
-        --topn-beam-size=*)
-            topn_beam_size=${1#*=}
+        --fixed-site-beam-size=*|--topn-beam-size=*)
+            fixed_site_beam_size=${1#*=}
             shift
             ;;
         *)
@@ -49,14 +54,14 @@ done
 set -- "${positional[@]}"
 
 if [[ $# -lt 3 || $# -gt 6 ]]; then
-    echo "Usage: $0 MODEL_PATH NUM_EVALS RESULT_NAME [FLOW_STEPS] [INPUT_CSV] [TARGET_CSV] [--sampling-mode n-shot|top-n] [--reuse-logits] [--cpu-workers N] [--topn-beam-size N]" >&2
+    echo "Usage: $0 MODEL_PATH NUM_SAMPLES RESULT_NAME [FLOW_STEPS] [INPUT_CSV] [TARGET_CSV] [--sampling-mode n-shot|top-n|greedy] [--enforce-composition|--no-enforce-composition] [--reuse-logits] [--cpu-workers N] [--fixed-site-beam-size N]" >&2
     exit 2
 fi
 
 model_path=$1
-num_evals=$2
+num_samples=$2
 result_name=$3
-flow_steps=${4:-}
+flow_steps=${4:-100}
 input_csv=${5:-example/input_test.csv}
 target_csv=${6:-data/mp20/test.csv}
 
@@ -72,33 +77,19 @@ else
     run_dir=$(dirname -- "$model_path")
 fi
 
-if [[ -z "$flow_steps" ]]; then
-    effective_flow_steps=$(uv run python - "$run_dir/hparams.yaml" <<'PY'
-import sys
-import yaml
-
-with open(sys.argv[1], encoding="utf-8") as handle:
-    config = yaml.safe_load(handle)
-print(int(config["model"]["model_config"]["flow_steps"]))
-PY
-    )
-else
-    effective_flow_steps=$flow_steps
-fi
-
 result_dir="${run_dir}/${result_name}"
 mode_suffix=""
 if [[ -z "$sampling_mode" ]]; then
     if [[ "$reuse_logits" == false ]]; then
         sampling_mode=n-shot
     fi
-elif [[ "$sampling_mode" == "top-n" ]]; then
-    mode_suffix="-top-n"
+elif [[ "$sampling_mode" == "top-n" || "$sampling_mode" == "greedy" ]]; then
+    mode_suffix="-${sampling_mode}"
 elif [[ "$sampling_mode" != "n-shot" ]]; then
     echo "Unsupported sampling mode: $sampling_mode" >&2
     exit 2
 fi
-result_stem="top-${num_evals}_flow_steps-${effective_flow_steps}${mode_suffix}"
+result_stem="top-${num_samples}_flow_steps-${flow_steps}${mode_suffix}"
 sample_path="${result_dir}/${result_stem}"
 logits_path="${sample_path}.logits.pt"
 template_csv="${result_dir}/${result_stem}.csv"
@@ -113,26 +104,30 @@ if [[ "$reuse_logits" == true ]]; then
         if [[ "$sampling_mode_explicit" == true ]]; then
             mapfile -t candidates < <(
                 find "$result_dir" -maxdepth 1 -type f \
-                    -name "top-${num_evals}_flow_steps-*${mode_suffix}.logits.pt" \
+                    -name "top-${num_samples}_flow_steps-*${mode_suffix}.logits.pt" \
                     -print | sort
             )
             if [[ "$sampling_mode" == "n-shot" ]]; then
                 filtered_candidates=()
                 for candidate in "${candidates[@]}"; do
-                    if [[ "$candidate" != *-top-n.logits.pt ]]; then
+                    if [[ "$candidate" != *-top-n.logits.pt && "$candidate" != *-greedy.logits.pt ]]; then
                         filtered_candidates+=("$candidate")
                     fi
                 done
                 candidates=("${filtered_candidates[@]}")
             fi
         else
-            nshot_pattern="${result_dir}/top-${num_evals}_flow_steps-${effective_flow_steps}.logits.pt"
-            topn_pattern="${result_dir}/top-${num_evals}_flow_steps-${effective_flow_steps}-top-n.logits.pt"
+            nshot_pattern="${result_dir}/top-${num_samples}_flow_steps-${flow_steps}.logits.pt"
+            topn_pattern="${result_dir}/top-${num_samples}_flow_steps-${flow_steps}-top-n.logits.pt"
+            greedy_pattern="${result_dir}/top-${num_samples}_flow_steps-${flow_steps}-greedy.logits.pt"
             if [[ -f "$nshot_pattern" ]]; then
                 candidates+=("$nshot_pattern")
             fi
             if [[ -f "$topn_pattern" ]]; then
                 candidates+=("$topn_pattern")
+            fi
+            if [[ -f "$greedy_pattern" ]]; then
+                candidates+=("$greedy_pattern")
             fi
         fi
         if [[ ${#candidates[@]} -eq 1 ]]; then
@@ -153,10 +148,11 @@ if [[ "$reuse_logits" == true ]]; then
         fi
     fi
 
-    echo "[1/3] Skipping GPU flow; repairing saved logits: ${logits_path}"
+    echo "[1/3] Skipping GPU flow; decoding saved logits: ${logits_path}"
     reuse_args=(
         --model_path "$model_path"
         --save_path "$sample_path"
+        --num-samples "$num_samples"
         --logits_path "$logits_path"
         --cpu-workers "$cpu_workers"
         --reuse-logits
@@ -164,41 +160,39 @@ if [[ "$reuse_logits" == true ]]; then
     if [[ "$sampling_mode_explicit" == true ]]; then
         reuse_args+=(--sampling-mode "$sampling_mode")
     fi
-    if [[ -n "$topn_beam_size" ]]; then
-        reuse_args+=(--topn-beam-size "$topn_beam_size")
+    if [[ -n "$fixed_site_beam_size" ]]; then
+        reuse_args+=(--fixed-site-beam-size "$fixed_site_beam_size")
     fi
-    uv run python scripts/sample_wy.py "${reuse_args[@]}"
+    uv run python scripts/sample_wy.py "${reuse_args[@]}" "${composition_args[@]}"
 else
     sampling_mode=${sampling_mode:-n-shot}
-    echo "[1/3] Sampling ${num_evals} templates per target"
+    echo "[1/3] Sampling ${num_samples} templates per target"
     sample_args=(
         --model_path "$model_path" \
         --formula_file "$input_csv" \
-        --num_evals "$num_evals" \
+        --num-samples "$num_samples" \
         --batch_size 128 \
+        --flow_steps "$flow_steps" \
         --cpu-workers "$cpu_workers" \
         --sampling-mode "$sampling_mode" \
         --save_path "$sample_path"
     )
-    if [[ -n "$flow_steps" ]]; then
-        sample_args+=(--flow_steps "$flow_steps")
+    if [[ -n "$fixed_site_beam_size" ]]; then
+        sample_args+=(--fixed-site-beam-size "$fixed_site_beam_size")
     fi
-    if [[ -n "$topn_beam_size" ]]; then
-        sample_args+=(--topn-beam-size "$topn_beam_size")
-    fi
-    uv run python scripts/sample_wy.py "${sample_args[@]}"
+    uv run python scripts/sample_wy.py "${sample_args[@]}" "${composition_args[@]}"
 fi
 
 echo "[2/3] Extracting generated templates"
 uv run python scripts/extract_wyckoff_samples.py \
     --input_pt "${sample_path}.pt" \
     --output_csv "$template_csv" \
-    --top_k "$num_evals"
+    --top_k "$num_samples"
 
-echo "[3/3] Evaluating G-W-A Top-${num_evals}"
+echo "[3/3] Evaluating G-W-A Top-${num_samples}"
 uv run python scripts/eval_gwa.py \
     --target_path "$target_csv" \
     --gen_path "$template_csv" \
-    --top_k "$num_evals" \
+    --top_k "$num_samples" \
     --output_path "$evaluation_csv" \
     --summary_path "$summary_json"

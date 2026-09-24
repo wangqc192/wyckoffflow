@@ -18,7 +18,10 @@ def occupancy_key(value: object) -> tuple[str, ...]:
 
     if isinstance(value, Number) and not isinstance(value, bool):
         return (str(int(value)),)
-    return WyckoffTemplate.from_crystalflow(str(value)).occupancy_key()
+    value = str(value)
+    if value.isdigit():
+        return (value,)
+    return WyckoffTemplate.from_crystalflow(value).occupancy_key()
 
 
 def target_occupancy_keys(protostructure: str) -> set[tuple[str, ...]]:

@@ -5,16 +5,27 @@ import multiprocessing
 import os
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import lru_cache
 
 import torch
-from wyckoff_generation.common.composition import decode_composition
+from torch_geometric.data import Data
 
 from ..common import lookup_tables
 from .model_utils import create_x_matrix
 
 DEFAULT_CPU_WORKERS = 52
 DEFAULT_CPU_TASK_SIZE = 32
+
+
+@dataclass
+class DecodingResult:
+    samples: list[Data]
+    infeasible_graph_indices: list[int]
+
+
+class InfeasibleCompositionError(ValueError):
+    """The space group cannot realize the requested composition."""
 
 
 def _space_group_multiplicities(space_group):
@@ -106,17 +117,19 @@ def _gumbel_like(values):
 
 
 def _variable_count_dp(scores, multiplicities, target):
+    max_variable_count = scores.shape[1] - 1
+    scores = scores.tolist()
     layers = [{0: (0.0, -1, -1)}]
     for position, multiplicity in enumerate(multiplicities):
         current = {}
         for subtotal, (base_score, _, _) in layers[-1].items():
             max_count = min(
-                scores.shape[1] - 1,
+                max_variable_count,
                 (target - subtotal) // multiplicity,
             )
             for count in range(max_count + 1):
                 total = subtotal + count * multiplicity
-                score = base_score + float(scores[position, count])
+                score = base_score + scores[position][count]
                 if total not in current or score > current[total][0]:
                     current[total] = (score, subtotal, count)
         layers.append(current)
@@ -141,12 +154,14 @@ def _variable_count_topk(scores, multiplicities, target, candidate_count):
     sampling the same template again.
     """
 
+    max_variable_count = scores.shape[1] - 1
+    scores = scores.tolist()
     layers = [{0: [(0.0, ())]}]
     for position, multiplicity in enumerate(multiplicities):
         current = {}
         for subtotal, paths in layers[-1].items():
             max_count = min(
-                scores.shape[1] - 1,
+                max_variable_count,
                 (target - subtotal) // multiplicity,
             )
             for base_score, base_path in paths:
@@ -154,7 +169,7 @@ def _variable_count_topk(scores, multiplicities, target, candidate_count):
                     total = subtotal + count * multiplicity
                     current.setdefault(total, []).append(
                         (
-                            base_score + float(scores[position, count]),
+                            base_score + scores[position][count],
                             base_path + (count,),
                         )
                     )
@@ -181,7 +196,7 @@ def _decode_single_candidates_with_beam(
     elements = torch.nonzero(target_composition[1:] > 0).flatten() + 1
     targets = tuple(int(target_composition[element]) for element in elements.tolist())
     zero_columns = torch.cat((torch.zeros(1, dtype=torch.long), elements))
-    zero_scores = zero_logits[:, zero_columns]
+    zero_scores = zero_logits[:, zero_columns].tolist()
     inf_scores = inf_logits[:, elements - 1]
 
     reachable = _reachable_counts(
@@ -189,7 +204,9 @@ def _decode_single_candidates_with_beam(
     )
     fallback = _fixed_assignment(targets, tuple(zero_multiplicities), reachable)
     if fallback is None:
-        raise ValueError("Space group cannot realize the requested composition")
+        raise InfeasibleCompositionError(
+            "Space group cannot realize the requested composition"
+        )
 
     variable_paths = [
         _variable_count_topk(
@@ -221,7 +238,7 @@ def _decode_single_candidates_with_beam(
                     next_used = tuple(next_used)
                     expanded.setdefault(next_used, []).append(
                         (
-                            base_score + float(zero_scores[position, column]),
+                            base_score + zero_scores[position][column],
                             base_choices + (element,),
                         )
                     )
@@ -245,7 +262,7 @@ def _decode_single_candidates_with_beam(
         if fallback_key not in expanded:
             fallback_choices = fallback[: position + 1]
             fallback_score = sum(
-                float(zero_scores[index, max(choice + 1, 0)])
+                zero_scores[index][max(choice + 1, 0)]
                 for index, choice in enumerate(fallback_choices)
             )
             expanded[fallback_key] = [(fallback_score, fallback_choices)]
@@ -334,7 +351,7 @@ def _decode_single_candidates(
 
     The beam is only a performance limit.  If it hides feasible candidates, the
     beam is expanded until the requested number is found or all reachable
-    fixed-site states have been searched.  Thus a small ``topn_beam_size`` can
+    fixed-site states have been searched.  Thus a small ``fixed_site_beam_size`` can
     affect runtime, but it cannot cause an existing candidate to be duplicated
     to fill Top-N.
     """
@@ -390,13 +407,16 @@ def _decode_single(
     if stochastic:
         zero_scores = zero_scores + _gumbel_like(zero_scores)
         inf_scores = inf_scores + _gumbel_like(inf_scores)
+    zero_scores = zero_scores.tolist()
 
     reachable = _reachable_counts(
         tuple(inf_multiplicities), max_variable_count, max(targets)
     )
     fallback = _fixed_assignment(targets, tuple(zero_multiplicities), reachable)
     if fallback is None:
-        raise ValueError("Space group cannot realize the requested composition")
+        raise InfeasibleCompositionError(
+            "Space group cannot realize the requested composition"
+        )
 
     variable_layers = [
         _variable_count_dp(inf_scores[:, index], inf_multiplicities, target)
@@ -422,7 +442,7 @@ def _decode_single(
                 if element >= 0:
                     next_used[element] += multiplicity
                 next_used = tuple(next_used)
-                next_score = score + float(zero_scores[position, column])
+                next_score = score + zero_scores[position][column]
                 if next_used not in expanded or next_score > expanded[next_used][0]:
                     expanded[next_used] = (
                         next_score,
@@ -445,7 +465,7 @@ def _decode_single(
         if fallback_key not in expanded:
             fallback_choices = fallback[: position + 1]
             fallback_score = sum(
-                float(zero_scores[index, max(choice + 1, 0)])
+                zero_scores[index][max(choice + 1, 0)]
                 for index, choice in enumerate(fallback_choices)
             )
             expanded[fallback_key] = (fallback_score, fallback_choices)
@@ -502,31 +522,35 @@ def cpu_dp_pool(cpu_workers, num_graphs):
         yield executor, worker_count
 
 
-def _candidate_probability(
+def _decoder_log_score(
     zero_logits,
     inf_logits,
     target_composition,
     decoded_zero,
     decoded_inf,
 ):
-    """Return the model probability of one decoded template."""
-    zero_log_probability = torch.log_softmax(zero_logits, dim=-1).gather(
-        1, decoded_zero.long().unsqueeze(-1)
-    ).sum()
+    """Sum log probabilities under the final categorical decoder outputs.
+
+    This is conditional on the sampled flow state, not the marginal template
+    probability integrated over flow trajectories.
+    """
+    zero_log_probability = (
+        torch.log_softmax(zero_logits, dim=-1)
+        .gather(1, decoded_zero.long().unsqueeze(-1))
+        .sum()
+    )
 
     elements = torch.nonzero(target_composition[1:] > 0).flatten()
     if elements.numel():
         element_logits = inf_logits[:, elements, :]
         element_counts = decoded_inf[:, elements].long().unsqueeze(-1)
-        variable_log_probability = torch.log_softmax(
-            element_logits, dim=-1
-        ).gather(-1, element_counts).sum()
+        variable_log_probability = (
+            torch.log_softmax(element_logits, dim=-1).gather(-1, element_counts).sum()
+        )
     else:
         variable_log_probability = zero_log_probability.new_zeros(())
 
-    return float(
-        torch.exp(zero_log_probability + variable_log_probability).item()
-    )
+    return float((zero_log_probability + variable_log_probability).item())
 
 
 def _decode_single_task(
@@ -534,7 +558,7 @@ def _decode_single_task(
     inf_logits,
     task,
     max_variable_count,
-    zero_beam_size,
+    fixed_site_beam_size,
     stochastic,
     candidate_count=None,
 ):
@@ -550,7 +574,7 @@ def _decode_single_task(
         seed,
     ) = task
     if seed is not None:
-        torch.manual_seed(seed)
+        torch.random.default_generator.manual_seed(seed)
     target_composition = torch.zeros(inf_logits.shape[1] + 1)
     for element, count in positive_targets:
         target_composition[element] = count
@@ -564,7 +588,7 @@ def _decode_single_task(
                     inf_multiplicities,
                     target_composition,
                     max_variable_count,
-                    zero_beam_size,
+                    fixed_site_beam_size,
                     stochastic=stochastic,
                 )
             ]
@@ -576,18 +600,16 @@ def _decode_single_task(
                 inf_multiplicities,
                 target_composition,
                 max_variable_count,
-                zero_beam_size,
+                fixed_site_beam_size,
                 candidate_count,
             )
-    except ValueError as error:
-        if str(error) != "Space group cannot realize the requested composition":
-            raise
+    except InfeasibleCompositionError:
         return graph_index, None
     return graph_index, [
         (
             decoded_zero.numpy(),
             decoded_inf.numpy(),
-            _candidate_probability(
+            _decoder_log_score(
                 zero_logits[zero_start:zero_stop],
                 inf_logits[inf_start:inf_stop],
                 target_composition,
@@ -605,7 +627,7 @@ def _decode_task_chunk(task):
         inf_logits,
         graph_tasks,
         max_variable_count,
-        zero_beam_size,
+        fixed_site_beam_size,
         stochastic,
         candidate_count,
     ) = task
@@ -615,7 +637,7 @@ def _decode_task_chunk(task):
             inf_logits,
             graph_task,
             max_variable_count,
-            zero_beam_size,
+            fixed_site_beam_size,
             stochastic,
             candidate_count,
         )
@@ -641,7 +663,7 @@ def _decode_graphs(
     inf_logits,
     graph_indices,
     max_variable_count,
-    zero_beam_size,
+    fixed_site_beam_size,
     stochastic,
     cpu_workers=DEFAULT_CPU_WORKERS,
     cpu_task_size=DEFAULT_CPU_TASK_SIZE,
@@ -653,7 +675,7 @@ def _decode_graphs(
         raise ValueError("candidate_count must be positive")
     graph_indices = [int(index) for index in graph_indices]
     if not graph_indices:
-        return data.x_0_dof, data.x_inf_dof, []
+        return {}, []
 
     targets = data.composition.detach().cpu().round().long()
     space_groups = data.space_group.detach().cpu().reshape(-1)
@@ -679,9 +701,7 @@ def _decode_graphs(
     if progress is not None and infeasible_graph_indices:
         progress.update(len(infeasible_graph_indices))
     if not feasible_graph_indices:
-        if candidate_count is not None:
-            return {}, infeasible_graph_indices
-        return data.x_0_dof, data.x_inf_dof, infeasible_graph_indices
+        return {}, infeasible_graph_indices
 
     owns_executor = executor is None
     if owns_executor:
@@ -751,13 +771,11 @@ def _decode_graphs(
                     inf_logits,
                     chunk,
                     max_variable_count,
-                    zero_beam_size,
+                    fixed_site_beam_size,
                     stochastic,
                     candidate_count,
                 )
 
-        repaired_zero = data.x_0_dof.detach().cpu().long().clone()
-        repaired_inf = data.x_inf_dof.detach().cpu().long().clone()
         candidate_results = {}
 
         def store(decoded_chunk):
@@ -771,27 +789,16 @@ def _decode_graphs(
                             refresh=False,
                         )
                     continue
-                if candidate_count is None:
-                    decoded_zero, decoded_inf = decoded[0][:2]
-                    zero_start = int(zero_offsets[graph_index])
-                    zero_stop = int(zero_offsets[graph_index + 1])
-                    inf_start = int(inf_offsets[graph_index])
-                    inf_stop = int(inf_offsets[graph_index + 1])
-                    repaired_zero[zero_start:zero_stop] = torch.from_numpy(decoded_zero)
-                    repaired_inf[inf_start:inf_stop] = torch.from_numpy(decoded_inf)
-                else:
-                    candidate_results[graph_index] = decoded
+                candidate_results[graph_index] = decoded
                 if progress is not None and hasattr(progress, "set_postfix"):
                     rank = len(decoded) if candidate_count is not None else 1
                     requested = candidate_count if candidate_count is not None else 1
-                    probability = decoded[-1][2] if decoded else None
+                    log_score = decoded[-1][2] if decoded else None
                     progress.set_postfix(
                         graph=graph_index,
                         template_rank=f"{rank}/{requested}",
-                        probability=(
-                            f"{probability:.3e}"
-                            if probability is not None
-                            else "n/a"
+                        decoder_log_score=(
+                            f"{log_score:.3f}" if log_score is not None else "n/a"
                         ),
                         refresh=False,
                     )
@@ -818,168 +825,72 @@ def _decode_graphs(
                     if task_chunk is not None:
                         pending.add(executor.submit(_decode_task_chunk, task_chunk))
 
-        if candidate_count is not None:
-            return candidate_results, sorted(infeasible_graph_indices)
-        return (
-            repaired_zero.to(data.x_0_dof.device),
-            repaired_inf.to(data.x_inf_dof.device),
-            sorted(infeasible_graph_indices),
-        )
+        return candidate_results, sorted(infeasible_graph_indices)
     finally:
         if owns_executor:
             pool.__exit__(None, None, None)
 
 
-def _candidate_data_list(data, candidate_results):
-    graph_data = data.to_data_list()
+def _decoded_data_list(data, candidate_results, *, rank_candidates):
     samples = []
-    seen_by_group = {}
-    for graph_index in sorted(candidate_results):
-        graph = graph_data[graph_index]
-        if hasattr(graph, "sampling_group"):
-            group = int(graph.sampling_group.reshape(-1)[0])
-        elif hasattr(graph, "target_index"):
-            group = int(graph.target_index.reshape(-1)[0])
-        else:
-            group = graph_index
-        seen = seen_by_group.setdefault(group, set())
-        for candidate in candidate_results[graph_index]:
-            decoded_zero, decoded_inf = candidate[:2]
-            candidate_probability = candidate[2] if len(candidate) > 2 else None
-            signature = (decoded_zero.tobytes(), decoded_inf.tobytes())
-            if signature in seen:
-                continue
-            seen.add(signature)
-            graph_copy = graph.clone()
-            graph_copy.x_0_dof = torch.from_numpy(decoded_zero).to(
-                graph_copy.x_0_dof.device
+    for graph_index, graph in enumerate(data.to_data_list()):
+        for rank, (decoded_zero, decoded_inf, log_score) in enumerate(
+            candidate_results.get(graph_index, []), start=1
+        ):
+            sample = graph.clone().cpu()
+            sample.x_0_dof = torch.from_numpy(decoded_zero).clone()
+            sample.x_inf_dof = torch.from_numpy(decoded_inf).clone()
+            sample.x = create_x_matrix(
+                sample.x_inf_dof, sample.x_0_dof, sample.zero_dof
             )
-            graph_copy.x_inf_dof = torch.from_numpy(decoded_inf).to(
-                graph_copy.x_inf_dof.device
-            )
-            graph_copy.x = create_x_matrix(
-                graph_copy.x_inf_dof,
-                graph_copy.x_0_dof,
-                graph_copy.zero_dof,
-            )
-            graph_copy.candidate_rank = torch.tensor(
-                len(seen), dtype=torch.long, device=graph_copy.x.device
-            )
-            if candidate_probability is not None:
-                graph_copy.candidate_probability = torch.tensor(
-                    candidate_probability,
-                    dtype=torch.float64,
-                    device=graph_copy.x.device,
-                )
-            samples.append(graph_copy)
+            if rank_candidates:
+                sample.candidate_rank = torch.tensor(rank, dtype=torch.long)
+            sample.decoder_log_score = torch.tensor(log_score, dtype=torch.float64)
+            samples.append(sample)
     return samples
 
 
-def sample_batch_to_compositions(
+def decode_composition_logits(
     data,
     zero_logits,
     inf_logits,
     max_variable_count,
-    zero_beam_size=256,
+    *,
     stochastic=True,
+    num_candidates=None,
+    fixed_site_beam_size=256,
     cpu_workers=DEFAULT_CPU_WORKERS,
     cpu_task_size=DEFAULT_CPU_TASK_SIZE,
     executor=None,
     progress=None,
-    announce=True,
-    return_infeasible=False,
-    candidate_count=None,
 ):
-    """Decode graphs with exact composition constraints.
+    """Decode each graph without mutating its flow state.
 
-    ``candidate_count=None`` keeps the original n-shot behavior: each input
-    graph produces one candidate, stochastically when ``stochastic=True``.
-    Passing any positive integer enables deterministic top-N decoding and
-    returns up to that many distinct candidates per input graph.  In particular,
-    ``candidate_count=1`` is deterministic Top-1 rather than n-shot sampling.
+    By default return one assignment per trajectory, with optional stochastic
+    score perturbations. For deterministic candidate search, num_candidates
+    requests up to that many distinct assignments per graph, ordered by final
+    decoder score. Failed graph indices are always returned separately, and
+    samples are always a CPU list of Data objects.
     """
-
-    num_graphs = data.composition.shape[0]
-    if announce:
-        worker_count = cpu_dp_worker_count(cpu_workers, num_graphs)
-        print(
-            f"[count_conserving] repair {num_graphs}/{num_graphs} graphs "
-            f"with CPU DP using {worker_count} workers"
-        )
-    decoded = _decode_graphs(
+    candidate_results, infeasible = _decode_graphs(
         data,
         zero_logits,
         inf_logits,
-        range(num_graphs),
+        range(data.num_graphs),
         max_variable_count,
-        zero_beam_size,
+        fixed_site_beam_size,
         stochastic,
         cpu_workers,
         cpu_task_size,
         executor,
         progress,
-        candidate_count,
+        None if stochastic else num_candidates,
     )
-    if candidate_count is not None:
-        candidate_results, infeasible_graph_indices = decoded
-        samples = _candidate_data_list(data, candidate_results)
-        if return_infeasible:
-            return samples, len(samples), infeasible_graph_indices
-        if infeasible_graph_indices:
-            raise ValueError("Space group cannot realize the requested composition")
-        return samples, len(samples)
-
-    data.x_0_dof, data.x_inf_dof, infeasible_graph_indices = decoded
-    data.x = create_x_matrix(data.x_inf_dof, data.x_0_dof, data.zero_dof)
-    if return_infeasible:
-        return (
+    return DecodingResult(
+        _decoded_data_list(
             data,
-            num_graphs - len(infeasible_graph_indices),
-            infeasible_graph_indices,
-        )
-    if infeasible_graph_indices:
-        raise ValueError("Space group cannot realize the requested composition")
-    return data, num_graphs
-
-
-def repair_batch_to_compositions(
-    data,
-    zero_logits,
-    inf_logits,
-    max_variable_count,
-    zero_beam_size=256,
-    stochastic=True,
-    cpu_workers=DEFAULT_CPU_WORKERS,
-    cpu_task_size=DEFAULT_CPU_TASK_SIZE,
-    executor=None,
-    progress=None,
-):
-    """Replace mismatching samples with exact count-conserving assignments."""
-
-    targets = data.composition
-    decoded = decode_composition(data, targets.shape[1] - 1)
-    repair_indices = torch.nonzero(
-        torch.any(decoded.round() != targets.round(), dim=1)
-    ).flatten()
-    num_repairs = repair_indices.numel()
-    print(f"[count_conserving] repair {num_repairs}/{targets.shape[0]} graphs")
-    if num_repairs == 0:
-        return data, 0
-
-    data.x_0_dof, data.x_inf_dof, infeasible_graph_indices = _decode_graphs(
-        data,
-        zero_logits,
-        inf_logits,
-        repair_indices.tolist(),
-        max_variable_count,
-        zero_beam_size,
-        stochastic,
-        cpu_workers,
-        cpu_task_size,
-        executor,
-        progress,
+            candidate_results,
+            rank_candidates=not stochastic and num_candidates is not None,
+        ),
+        infeasible,
     )
-    if infeasible_graph_indices:
-        raise ValueError("Space group cannot realize the requested composition")
-    data.x = create_x_matrix(data.x_inf_dof, data.x_0_dof, data.zero_dof)
-    return data, num_repairs

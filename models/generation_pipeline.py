@@ -20,22 +20,10 @@ import torch
 from torch_geometric.data import Batch, Data
 
 from models.common.checkpoint import load_model
-from models.common.composition import formula_to_counts
 from models.common.lookup_tables import chemical_symbols
 from models.common.wyckoff_template import WyckoffTemplate
-from models.pl_models.count_conserving import (
-    formula_supported_by_space_group,
-    sample_batch_to_compositions,
-)
-
-
-class SamplingData(Data):
-    """PyG data object whose metadata labels are global, not node offsets."""
-
-    def __inc__(self, key, value, *args, **kwargs):
-        if key in {"target_index", "sampling_group"}:
-            return 0
-        return super().__inc__(key, value, *args, **kwargs)
+from models.pl_models.count_conserving import formula_supported_by_space_group
+from models.sampling import SAMPLING_MODES, make_condition, sample_batch
 
 
 def parse_formula_counts(formula: str) -> dict[str, int]:
@@ -100,55 +88,34 @@ def query_from_sequence(sequence: str) -> dict[str, Any]:
 
 
 def _sample_one_space_group(
-    model,
-    formula: str,
-    space_group: int,
-    pool_size: int,
-    *,
-    flow_steps: int | None,
-    sampling_mode: str = "n-shot",
+    model, formula, space_group, num_samples, *, flow_steps, sampling_mode="n-shot"
 ):
-    num_elements = int(model.num_elements)
-    data = Data(
-        formula=formula_to_counts(formula, num_elements).unsqueeze(0),
-        num_evals=torch.tensor(
-            1 if sampling_mode == "top-n" else pool_size,
-            dtype=torch.long,
-        ),
-        space_group=torch.tensor(int(space_group), dtype=torch.long),
-    )
-    batch = Batch.from_data_list([data])
+    condition = make_condition(formula, space_group, model.num_elements, target_index=0)
+    return sample_batch(
+        model,
+        Batch.from_data_list([condition]),
+        flow_steps=flow_steps,
+        num_samples=num_samples,
+        sampling_mode=sampling_mode,
+    ).samples
+
+
+def _rank_template_samples(samples, target_counts, sampling_mode):
+    frequencies = Counter()
+    representatives = {}
+    for sample in samples:
+        sequence = structure_sequence(sample)
+        if exact_counts_from_sequence(sequence) != target_counts:
+            continue
+        frequencies[sequence] += 1
+        representatives.setdefault(sequence, sample.cpu())
     if sampling_mode == "top-n":
-        data_t, zero_logits, inf_logits = model.sample_logits(
-            batch,
-            flow_steps=flow_steps,
+        ranked = sorted(
+            representatives, key=lambda key: int(representatives[key].candidate_rank)
         )
-        generated, _, infeasible = sample_batch_to_compositions(
-            data_t,
-            zero_logits,
-            inf_logits,
-            int(model.max_num_atoms),
-            stochastic=False,
-            candidate_count=pool_size,
-            cpu_workers=1,
-            return_infeasible=True,
-        )
-        if infeasible:
-            return []
-        return generated
-    if sampling_mode != "n-shot":
-        raise ValueError(f"unsupported sampling_mode: {sampling_mode}")
-    try:
-        generated = model.sample(
-            batch,
-            count_conserving=True,
-            flow_steps=flow_steps,
-        )
-    except ValueError as error:
-        if str(error) == "Space group cannot realize the requested composition":
-            return []
-        raise
-    return generated.to_data_list()
+    else:
+        ranked = sorted(representatives, key=lambda key: (-frequencies[key], key))
+    return ranked, frequencies, representatives
 
 
 def sample_wyckoff_templates(
@@ -158,42 +125,33 @@ def sample_wyckoff_templates(
     *,
     templates_per_space_group: int = 4,
     template_pool_size: int = 16,
-    flow_steps: int | None = None,
+    flow_steps: int,
     sampling_mode: str = "n-shot",
 ) -> list[dict[str, Any]]:
     """Sample and deduplicate exact-composition templates for each SG rank."""
 
     target_formula = format_formula(parse_formula_counts(formula))
     target_counts = parse_formula_counts(target_formula)
-    if sampling_mode not in {"n-shot", "top-n"}:
+    if sampling_mode not in SAMPLING_MODES:
         raise ValueError(f"unsupported sampling_mode: {sampling_mode}")
     rows: list[dict[str, Any]] = []
     for sg_rank, space_group in enumerate(ranked_space_groups, start=1):
-        sample_kwargs = {"flow_steps": flow_steps}
-        if sampling_mode == "top-n":
-            sample_kwargs["sampling_mode"] = sampling_mode
         samples = _sample_one_space_group(
             flow_model,
             target_formula,
             int(space_group),
-            templates_per_space_group
-            if sampling_mode == "top-n"
-            else template_pool_size,
-            **sample_kwargs,
+            (
+                templates_per_space_group
+                if sampling_mode == "top-n"
+                else template_pool_size
+            ),
+            flow_steps=flow_steps,
+            sampling_mode=sampling_mode,
         )
-        frequencies: Counter[str] = Counter()
-        representatives: dict[str, Data] = {}
-        for sample in samples:
-            sequence = structure_sequence(sample)
-            candidate_counts = exact_counts_from_sequence(sequence)
-            if candidate_counts != target_counts:
-                continue
-            frequencies[sequence] += 1
-            representatives.setdefault(sequence, sample.cpu())
-        ranked = sorted(
-            representatives,
-            key=lambda value: (-frequencies[value], value),
-        )[:templates_per_space_group]
+        ranked, frequencies, representatives = _rank_template_samples(
+            samples, target_counts, sampling_mode
+        )
+        ranked = ranked[:templates_per_space_group]
         for template_rank, sequence in enumerate(ranked, start=1):
             query = query_from_sequence(sequence)
             rows.append(
@@ -286,124 +244,33 @@ def write_selected_queries(rows: list[dict[str, Any]], path: Path) -> None:
 
 
 def _sample_record_batch(
-    model,
-    records: list[dict[str, Any]],
-    pool_size: int,
-    *,
-    flow_steps: int | None,
-    sampling_mode: str = "n-shot",
-) -> list[tuple[dict[str, Any], list[Data]]]:
-    """Sample a uniform batch of formula/space-group conditions."""
-
+    model, records, num_samples, *, flow_steps, sampling_mode="n-shot"
+):
+    """Sample all condition pairs once, preserving empty groups for failed inputs."""
     if not records:
         return []
-    if sampling_mode not in {"n-shot", "top-n"}:
-        raise ValueError(f"unsupported sampling_mode: {sampling_mode}")
-    data_list = [
-        SamplingData(
-            formula=formula_to_counts(
-                record["formula"], int(model.num_elements)
-            ).unsqueeze(0),
-            num_evals=torch.tensor(
-                1 if sampling_mode == "top-n" else pool_size,
-                dtype=torch.long,
-            ),
-            space_group=torch.tensor(record["generated_space_group"], dtype=torch.long),
-            **(
-                {
-                    "target_index": torch.tensor(
-                        record["target_index"], dtype=torch.long
-                    ),
-                    # A target can occur once for each predicted space group.
-                    # Keep those condition pairs separate during top-n decoding.
-                    "sampling_group": torch.tensor(group, dtype=torch.long),
-                }
-                if sampling_mode == "top-n"
-                else {}
-            ),
-        )
-        for group, record in enumerate(records)
-    ]
-    batch = Batch.from_data_list(data_list)
-    if sampling_mode == "top-n":
-        try:
-            data_t, zero_logits, inf_logits = model.sample_logits(
-                batch,
-                flow_steps=flow_steps,
+    batch = Batch.from_data_list(
+        [
+            make_condition(
+                record["formula"],
+                record["generated_space_group"],
+                model.num_elements,
+                record["target_index"],
             )
-        except ValueError as error:
-            if str(error) != "Space group cannot realize the requested composition":
-                raise
-            if len(records) == 1:
-                return [(records[0], [])]
-            midpoint = len(records) // 2
-            return _sample_record_batch(
-                model,
-                records[:midpoint],
-                pool_size,
-                flow_steps=flow_steps,
-                sampling_mode=sampling_mode,
-            ) + _sample_record_batch(
-                model,
-                records[midpoint:],
-                pool_size,
-                flow_steps=flow_steps,
-                sampling_mode=sampling_mode,
-            )
-        generated, _, infeasible = sample_batch_to_compositions(
-            data_t,
-            zero_logits,
-            inf_logits,
-            int(model.max_num_atoms),
-            stochastic=False,
-            candidate_count=pool_size,
-            cpu_workers=1,
-            return_infeasible=True,
-        )
-        infeasible = set(infeasible)
-        by_group = {group: [] for group in range(len(records))}
-        for sample in generated:
-            sampling_group = int(sample.sampling_group.reshape(-1)[0])
-            by_group[sampling_group].append(sample)
-        return [
-            (record, [] if index in infeasible else by_group[index])
-            for index, record in enumerate(records)
+            for record in records
         ]
-    try:
-        generated = model.sample(
-            batch,
-            count_conserving=True,
-            flow_steps=flow_steps,
-        ).to_data_list()
-    except ValueError as error:
-        if str(error) != "Space group cannot realize the requested composition":
-            raise
-        if len(records) == 1:
-            return [(records[0], [])]
-        midpoint = len(records) // 2
-        return _sample_record_batch(
-            model,
-            records[:midpoint],
-            pool_size,
-            flow_steps=flow_steps,
-            sampling_mode=sampling_mode,
-        ) + _sample_record_batch(
-            model,
-            records[midpoint:],
-            pool_size,
-            flow_steps=flow_steps,
-            sampling_mode=sampling_mode,
-        )
-
-    expected = len(records) * pool_size
-    if len(generated) != expected:
-        raise RuntimeError(
-            f"flow returned {len(generated)} samples, expected {expected}"
-        )
-    return [
-        (record, generated[index * pool_size : (index + 1) * pool_size])
-        for index, record in enumerate(records)
-    ]
+    )
+    result = sample_batch(
+        model,
+        batch,
+        flow_steps=flow_steps,
+        num_samples=num_samples,
+        sampling_mode=sampling_mode,
+    )
+    by_group = {index: [] for index in range(len(records))}
+    for sample in result.samples:
+        by_group[int(sample.sampling_group)].append(sample)
+    return [(record, by_group[index]) for index, record in enumerate(records)]
 
 
 def sample_wyckoff_templates_for_targets(
@@ -414,7 +281,7 @@ def sample_wyckoff_templates_for_targets(
     templates_per_space_group: int,
     template_pool_size: int,
     pair_batch_size: int = 32,
-    flow_steps: int | None = None,
+    flow_steps: int,
     sampling_mode: str = "n-shot",
 ) -> list[dict[str, Any]]:
     """Generate ranked exact-composition templates for a target CSV hierarchy."""
@@ -438,7 +305,7 @@ def sample_wyckoff_templates_for_targets(
         raise ValueError(
             "template_pool_size must be at least templates_per_space_group"
         )
-    if sampling_mode not in {"n-shot", "top-n"}:
+    if sampling_mode not in SAMPLING_MODES:
         raise ValueError(f"unsupported sampling_mode: {sampling_mode}")
 
     target_records = targets.set_index("target_index").to_dict("index")
@@ -473,9 +340,11 @@ def sample_wyckoff_templates_for_targets(
             _sample_record_batch(
                 flow_model,
                 pair_records[start : start + pair_batch_size],
-                templates_per_space_group
-                if sampling_mode == "top-n"
-                else template_pool_size,
+                (
+                    templates_per_space_group
+                    if sampling_mode == "top-n"
+                    else template_pool_size
+                ),
                 flow_steps=flow_steps,
                 sampling_mode=sampling_mode,
             )
@@ -484,23 +353,11 @@ def sample_wyckoff_templates_for_targets(
     rows: list[dict[str, Any]] = []
     for record, samples in sampled_pairs:
         target_counts = parse_formula_counts(record["formula"])
-        frequencies: Counter[str] = Counter()
-        representatives: dict[str, Data] = {}
-        for sample in samples:
-            sequence = structure_sequence(sample)
-            if exact_counts_from_sequence(sequence) != target_counts:
-                continue
-            frequencies[sequence] += 1
-            representatives.setdefault(sequence, sample.cpu())
-        ranked_sequences = sorted(
-            representatives, key=lambda value: (-frequencies[value], value)
+        ranked_sequences, frequencies, representatives = _rank_template_samples(
+            samples, target_counts, sampling_mode
         )
         if not ranked_sequences:
-            raise RuntimeError(
-                "flow produced no exact-composition template for "
-                f"target {record['target_index']}, space group "
-                f"{record['generated_space_group']}"
-            )
+            continue
         selected_sequences = ranked_sequences[:templates_per_space_group]
         if len(selected_sequences) < templates_per_space_group:
             print(

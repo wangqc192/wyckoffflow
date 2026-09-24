@@ -1,6 +1,20 @@
+import hydra
+import torch
 from hydra import compose, initialize_config_dir
 
+from models.common.composition import formula_to_counts
 from models.common.utils import PROJECT_ROOT
+from models.pl_models.gnn import WyckoffGNN
+
+
+class ScaledWyckoffGNN(WyckoffGNN):
+    def __init__(self, logit_scale, **kwargs):
+        super().__init__(**kwargs)
+        self.logit_scale = logit_scale
+
+    def forward(self, data, time):
+        zero_logits, inf_logits = super().forward(data, time)
+        return zero_logits * self.logit_scale, inf_logits * self.logit_scale
 
 
 def compose_config(*overrides):
@@ -19,14 +33,97 @@ def test_default_training_config_uses_local_flow_model():
         "models.pl_data.datamodule.CrystDataModule"
     )
     assert config.optim._target_ == "torch.optim.AdamW"
+    assert config.model.decoder._target_ == "models.pl_models.gnn.WyckoffGNN"
+    assert "model_config" not in config.model
+    assert "flow_steps" not in config.model
+    assert "hidden_dim" not in config.model
+    assert "composition_encoder_dim" not in config.model
+
+
+def test_decoder_overrides_support_forward_and_backward():
+    config = compose_config(
+        "model/decoder=wyckoff_gnn",
+        "model.decoder.num_gnn_layers=2",
+        "model.decoder.hidden_dim=8",
+        "model.decoder.dof_pos_sg_emb_size=4",
+        "model.decoder.composition_encoder_dim=4",
+        "model.decoder.mlp_hidden_layers=1",
+        "model.max_num_atoms=8",
+        "model.zero_df_loss_weight=2.0",
+        "model.inf_df_loss_weight=3.0",
+    )
+    model = hydra.utils.instantiate(
+        config.model, optimizer_config=config.optim, _recursive_=False
+    )
+    assert len(model.decoder.layers) == 2
+    assert model.decoder.zero_dof_embedding.embedding_dim == 8
+    assert len(model.decoder.composition_film_layers) == 2
+    assert model.max_num_atoms == 8
+    assert model.zero_df_loss_weight == 2.0
+    assert model.inf_df_loss_weight == 3.0
+    assert "model_config" not in model.hparams
+    assert "flow_steps" not in model.hparams
+    assert isinstance(model.configure_optimizers(), torch.optim.AdamW)
+
+    batch = model._build_source_from_compositions(
+        formula_to_counts("Ga4Te4", model.num_elements).unsqueeze(0),
+        fixed_space_group=194,
+    )
+    loss = model(batch)["loss"]
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert model.decoder.zero_df_out_mlp[-1].weight.grad is not None
+    assert model.decoder.inf_df_out_mlp[-1].weight.grad is not None
+    assert all(
+        torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+        if parameter.grad is not None
+    )
+
+
+def test_decoder_config_group_can_select_another_network(tmp_path):
+    decoder_dir = tmp_path / "model" / "decoder"
+    decoder_dir.mkdir(parents=True)
+    (decoder_dir / "scaled.yaml").write_text(
+        "defaults:\n  - wyckoff_gnn\n  - _self_\n"
+        f"_target_: {__name__}.ScaledWyckoffGNN\n"
+        "logit_scale: 2.0\n"
+        "num_gnn_layers: 1\n"
+        "hidden_dim: 8\n"
+        "dof_pos_sg_emb_size: 4\n"
+        "composition_encoder_dim: 4\n",
+        encoding="utf-8",
+    )
+    config = compose_config(
+        f"hydra.searchpath=[file://{tmp_path}]",
+        "model/decoder=scaled",
+        "model.max_num_atoms=8",
+    )
+    model = hydra.utils.instantiate(
+        config.model, optimizer_config=config.optim, _recursive_=False
+    )
+    assert isinstance(model.decoder, ScaledWyckoffGNN)
+    assert model.decoder.logit_scale == 2.0
+
+    batch = model._build_source_from_compositions(
+        formula_to_counts("Ga4Te4", model.num_elements).unsqueeze(0),
+        fixed_space_group=194,
+    )
+    time = torch.zeros(1)
+    zero_logits, inf_logits = model.decoder(batch, time)
+    base_zero, base_inf = WyckoffGNN.forward(model.decoder, batch, time)
+    torch.testing.assert_close(zero_logits, 2 * base_zero)
+    torch.testing.assert_close(inf_logits, 2 * base_inf)
 
 
 def test_space_group_experiment_overrides_model_and_epochs():
     config = compose_config("experiment=space_group")
 
     assert config.model._target_ == ("models.pl_models.space_group.SpaceGroupModule")
-    assert config.model.model_config.composition_encoder_dim == 256
-    assert config.model.model_config.compatibility is True
+    assert "model_config" not in config.model
+    assert config.model.composition_encoder_dim == 256
+    assert config.model.compatibility is True
     assert config.train.trainer.max_epochs == 200
 
 

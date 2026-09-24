@@ -9,7 +9,8 @@ If ``wyckoff_spglib`` contains several equivalent settings, the output reports
 both the highest-probability setting and the probability sum over all settings.
 The default ``true_template_probability`` column is the highest-probability
 setting, which is the quantity most directly comparable with a generated
-candidate's ``candidate_probability``.
+candidate's ``exp(decoder_log_score)``. Both quantities are conditional on the
+saved final flow state, not marginal probabilities over flow trajectories.
 """
 
 from __future__ import annotations

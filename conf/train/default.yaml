@@ -16,3 +16,12 @@ checkpoint:
   save_top_k: 1
   save_last: true
   every_n_epochs: 100
+
+reconstruction:
+  enabled: true
+  every_n_epochs: 100
+  num_samples: 20
+  flow_steps: 50
+  batch_size: 128
+  cpu_workers: 8
+  seed: ${seed}

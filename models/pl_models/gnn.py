@@ -123,17 +123,34 @@ class WyckoffGNNLayer(MessagePassing):
 
 
 class WyckoffGNN(nn.Module):
-    def __init__(self, config):
+    def __init__(
+        self,
+        num_elements,
+        max_num_atoms,
+        hidden_dim,
+        dof_pos_sg_emb_size,
+        num_gnn_layers,
+        gnn_activation,
+        mlp_hidden_layers,
+        mlp_activation,
+        composition_encoder_dim=None,
+        composition_film=False,
+        conditional_composition=False,
+        continuous_time=False,
+        t_max=None,
+        no_multiplicity_encoding=True,
+        binary_dof_encoding=True,
+        no_softmax=True,
+    ):
         super().__init__()
-        hidden_dim = config["hidden_dim"]
-        condition_dim = config["dof_pos_sg_emb_size"]
-        num_mlp_layers = config["mlp_hidden_layers"]
-        activation = config["mlp_activation"]
+        condition_dim = dof_pos_sg_emb_size
+        num_mlp_layers = mlp_hidden_layers
+        activation = mlp_activation
 
-        self.num_elements = config["num_elements"]
+        self.num_elements = num_elements
         self.max_atom_num = self.num_elements
-        self.max_num_atoms = config["max_num_atoms"]
-        self.binary_dof_encoding = config.get("binary_dof_encoding", True)
+        self.max_num_atoms = max_num_atoms
+        self.binary_dof_encoding = binary_dof_encoding
         self.inf_dof_embedding = nn.Embedding(self.max_num_atoms + 1, 1)
         self.inf_dof_linear = nn.Linear(self.num_elements, hidden_dim)
         self.zero_dof_embedding = nn.Embedding(self.num_elements + 1, hidden_dim)
@@ -145,17 +162,15 @@ class WyckoffGNN(nn.Module):
         self.sg_embedding = nn.Embedding(231, condition_dim)
         self.time_embedding = (
             ContinuousTimeEmbedding(condition_dim)
-            if config.get("continuous_time", False)
-            else nn.Embedding(config["t_max"], condition_dim)
+            if continuous_time
+            else nn.Embedding(t_max, condition_dim)
         )
         self.multiplicity_embedding = (
-            None
-            if config.get("no_multiplicity_encoding", True)
-            else nn.Embedding(193, condition_dim)
+            None if no_multiplicity_encoding else nn.Embedding(193, condition_dim)
         )
 
-        composition_dim = config.get("composition_encoder_dim")
-        if config.get("conditional_composition", False):
+        composition_dim = composition_encoder_dim
+        if conditional_composition:
             if composition_dim is None:
                 self.composition_encoder = get_mlp(
                     self.num_elements + 1,
@@ -183,7 +198,7 @@ class WyckoffGNN(nn.Module):
         else:
             self.composition_encoder = None
 
-        if config.get("composition_film", False) and composition_dim is None:
+        if composition_film and composition_dim is None:
             raise ValueError("composition_film requires a composition set encoder")
         self.layers = nn.ModuleList(
             WyckoffGNNLayer(
@@ -192,18 +207,18 @@ class WyckoffGNN(nn.Module):
                 2 * (hidden_dim + condition_dim),
                 num_mlp_layers,
                 activation,
-                use_softmax=not config.get("no_softmax", True),
+                use_softmax=not no_softmax,
             )
-            for _ in range(config["num_gnn_layers"])
+            for _ in range(num_gnn_layers)
         )
         self.composition_film_layers = (
             nn.ModuleList(
                 CompositionFiLM(composition_dim, hidden_dim) for _ in self.layers
             )
-            if config.get("composition_film", False)
+            if composition_film
             else None
         )
-        self.activation = getattr(nn, config["gnn_activation"])()
+        self.activation = getattr(nn, gnn_activation)()
         self.zero_df_out_mlp = get_mlp(
             hidden_dim,
             self.num_elements + 1,

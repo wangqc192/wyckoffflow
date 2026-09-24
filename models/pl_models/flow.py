@@ -1,5 +1,6 @@
 """Categorical flow matching for Wyckoff-position generation."""
 
+import hydra
 import torch
 import torch.nn.functional as F
 from torch.distributions import Categorical
@@ -11,9 +12,7 @@ from ..common.dataset_info import (
     MP20_INF_DOF_DISTRIBUTION,
     MP20_ZERO_DOF_DISTRIBUTION,
 )
-from .base import OptimizedLightningModule
-from .count_conserving import sample_batch_to_compositions
-from .gnn import WyckoffGNN
+from .base import OptimizedLightningModule, resolve_config
 from .model_utils import (
     create_wyckoff_graph,
     create_x_matrix,
@@ -21,10 +20,12 @@ from .model_utils import (
 )
 
 
-def categorical_flow_step(current, target_logits, jump_probability):
+def categorical_flow_step(current, target_logits, jump_probability, *, greedy=False):
     if current.numel() == 0:
         return current
-    target = Categorical(logits=target_logits).sample()
+    if greedy:
+        return target_logits.argmax(dim=-1)
+    target = Categorical(logits=target_logits, validate_args=False).sample()
     jump = torch.rand(current.shape, device=current.device) < jump_probability
     return torch.where(jump, target, current)
 
@@ -32,39 +33,49 @@ def categorical_flow_step(current, target_logits, jump_probability):
 class DiscreteFlowModule(OptimizedLightningModule):
     def __init__(
         self,
-        model_config,
         optimizer_config,
+        decoder,
+        num_elements,
+        max_num_atoms,
+        flow_source,
+        zero_df_loss_weight=1.0,
+        inf_df_loss_weight=1.0,
+        conditional_composition=True,
         validation_seed=42,
     ):
-        super().__init__(model_config, optimizer_config, "discrete_flow")
-        config = self.model_config
+        super().__init__(optimizer_config, "discrete_flow")
+        decoder = resolve_config(decoder)
+        self.save_hyperparameters(ignore=["optimizer_config"])
         self.validation_seed = validation_seed
-        self.save_hyperparameters({"validation_seed": validation_seed})
         self._validation_rng = None
-        self.num_elements = config["num_elements"]
-        self.max_num_atoms = config["max_num_atoms"]
-        self.flow_steps = config["flow_steps"]
-        self.count_conserving = config.get("count_conserving", False)
-        loss_weights = config.get("loss_weights", {})
-        self.zero_df_loss_weight = float(loss_weights.get("zero_df", 1.0))
-        self.inf_df_loss_weight = float(loss_weights.get("inf_df", 1.0))
+        self.num_elements = num_elements
+        self.max_num_atoms = max_num_atoms
+        self.zero_df_loss_weight = float(zero_df_loss_weight)
+        self.inf_df_loss_weight = float(inf_df_loss_weight)
         if self.zero_df_loss_weight < 0 or self.inf_df_loss_weight < 0:
             raise ValueError("loss weights must be non-negative")
-        if not config["conditional_composition"]:
+        if not conditional_composition:
             raise ValueError("DiscreteFlowModule requires conditional_composition=True")
 
         self.source_zero = CategoricalSource(
-            config["flow_source"],
+            flow_source,
             self.num_elements + 1,
             MP20_ZERO_DOF_DISTRIBUTION,
         )
         self.source_inf = CategoricalSource(
-            config["flow_source"],
+            flow_source,
             self.max_num_atoms + 1,
             MP20_INF_DOF_DISTRIBUTION,
         )
-        decoder_config = dict(config, continuous_time=True)
-        self.decoder = WyckoffGNN(decoder_config)
+        self.decoder_config = decoder
+        self.decoder = hydra.utils.instantiate(
+            self.decoder_config,
+            num_elements=self.num_elements,
+            max_num_atoms=self.max_num_atoms,
+            conditional_composition=conditional_composition,
+            continuous_time=True,
+            _recursive_=False,
+        )
 
     def forward(self, batch):
         data_t = batch.clone()
@@ -162,104 +173,71 @@ class DiscreteFlowModule(OptimizedLightningModule):
         )
         return zero_logits, inf_logits, allowed[:, 1:]
 
-    _mask_training_logits = _mask_logits
+    @torch.inference_mode()
+    def sample_logits(self, batch, flow_steps, *, greedy=False):
+        """Run one trajectory per condition, returning final CPU logits.
 
-    def _run_flow(self, batch, sample_flow_steps, defer_final_step=False):
-        batch = batch.to(self.device)
+        Greedy trajectories take the decoder argmax at every step, without
+        random jumps. Initial states still come from the configured source.
+        """
+        if flow_steps <= 0:
+            raise ValueError("flow_steps must be positive")
         formulas = batch.formula
         if formulas.ndim == 1:
             formulas = formulas.unsqueeze(0)
-        num_evals = int(batch.num_evals.reshape(-1)[0])
         space_groups = batch.space_group.reshape(-1)
 
         data_t = self._build_source_from_compositions(
-            formulas.repeat_interleave(num_evals, dim=0),
-            space_groups.repeat_interleave(num_evals),
+            formulas,
+            space_groups,
             (
-                batch.target_index.reshape(-1).repeat_interleave(num_evals)
+                batch.target_index.reshape(-1)
                 if hasattr(batch, "target_index")
                 else None
             ),
             (
-                batch.sampling_group.reshape(-1).repeat_interleave(num_evals)
+                batch.sampling_group.reshape(-1)
                 if hasattr(batch, "sampling_group")
                 else None
             ),
         )
 
-        for step in range(sample_flow_steps):
+        zero_indices = data_t.zero_dof.nonzero().flatten()
+        inf_indices = (~data_t.zero_dof).nonzero().flatten()
+        allowed = data_t.composition > 0
+        allowed[:, 0] = True
+        zero_mask = ~allowed[data_t.batch[zero_indices]]
+        inf_mask = (~allowed[:, 1:][data_t.batch[inf_indices]]).unsqueeze(-1) & (
+            torch.arange(self.max_num_atoms + 1, device=self.device) > 0
+        )
+        for step in range(flow_steps):
             time = torch.full(
                 (data_t.num_graphs,),
-                step / sample_flow_steps,
+                step / flow_steps,
                 device=self.device,
             )
             zero_logits, inf_logits = self.decoder(data_t, time)
-            zero_logits, inf_logits, _ = self._mask_logits(
-                zero_logits,
-                inf_logits,
-                data_t,
-            )
-            if defer_final_step and step == sample_flow_steps - 1:
-                return data_t, zero_logits.detach().cpu(), inf_logits.detach().cpu()
+            zero_logits = zero_logits.masked_fill(zero_mask, float("-inf"))
+            inf_logits = inf_logits.masked_fill(inf_mask, float("-inf"))
+            if step == flow_steps - 1:
+                break
 
-            jump_probability = 1 / (sample_flow_steps - step)
+            jump_probability = 1 / (flow_steps - step)
             data_t.x_0_dof = categorical_flow_step(
                 data_t.x_0_dof,
                 zero_logits,
                 jump_probability,
+                greedy=greedy,
             )
             data_t.x_inf_dof = categorical_flow_step(
                 data_t.x_inf_dof,
                 inf_logits,
                 jump_probability,
+                greedy=greedy,
             )
-            data_t.x = create_x_matrix(
-                data_t.x_inf_dof,
-                data_t.x_0_dof,
-                data_t.zero_dof,
-            )
-
-        return data_t, None, None
-
-    @torch.inference_mode()
-    def sample_logits(self, batch, flow_steps=None):
-        """Run the GPU flow and return the final masked logits for CPU decoding."""
-
-        sample_flow_steps = self.flow_steps if flow_steps is None else int(flow_steps)
-        if sample_flow_steps <= 0:
-            raise ValueError("flow_steps must be positive")
-        return self._run_flow(batch, sample_flow_steps, defer_final_step=True)
-
-    @torch.inference_mode()
-    def sample(self, batch, count_conserving=None, flow_steps=None):
-        """Sample graphs from formula-conditioned records in ``batch``."""
-
-        use_count_conserving = (
-            self.count_conserving if count_conserving is None else count_conserving
-        )
-        sample_flow_steps = self.flow_steps if flow_steps is None else int(flow_steps)
-        if sample_flow_steps <= 0:
-            raise ValueError("flow_steps must be positive")
-
-        if use_count_conserving:
-            data_t, zero_logits, inf_logits = self.sample_logits(
-                batch, sample_flow_steps
-            )
-            data_t, _ = sample_batch_to_compositions(
-                data_t,
-                zero_logits,
-                inf_logits,
-                self.max_num_atoms,
-            )
-        else:
-            data_t, _, _ = self._run_flow(batch, sample_flow_steps)
-
-        data_t.x = create_x_matrix(
-            data_t.x_inf_dof,
-            data_t.x_0_dof,
-            data_t.zero_dof,
-        )
-        return data_t
+            data_t.x[zero_indices, 0] = data_t.x_0_dof.float()
+            data_t.x[inf_indices, 1:] = data_t.x_inf_dof.float()
+        return data_t.cpu(), zero_logits.cpu(), inf_logits.cpu()
 
     def _build_source_from_compositions(
         self,
@@ -268,50 +246,57 @@ class DiscreteFlowModule(OptimizedLightningModule):
         target_indices=None,
         sampling_groups=None,
     ):
-        compositions = compositions.to(self.device)
+        # Build graph metadata on CPU, then transfer and draw all source states
+        # in one batch instead of synchronizing CUDA once per graph/attribute.
+        compositions = compositions.cpu()
         if isinstance(fixed_space_group, torch.Tensor):
-            space_groups = fixed_space_group.to(self.device).reshape(-1)
+            space_groups = fixed_space_group.cpu().reshape(-1)
             if space_groups.numel() != compositions.shape[0]:
                 raise ValueError("space_group must contain one value per composition")
         else:
             space_groups = torch.full(
                 (compositions.shape[0],),
                 int(fixed_space_group),
-                device=self.device,
                 dtype=torch.long,
             )
         graphs = []
         if target_indices is None:
             target_indices = [None] * compositions.shape[0]
+        else:
+            target_indices = torch.as_tensor(target_indices).cpu()
         if sampling_groups is None:
             sampling_groups = [None] * compositions.shape[0]
+        else:
+            sampling_groups = torch.as_tensor(sampling_groups).cpu()
         for composition, space_group, target_index, sampling_group in zip(
             compositions, space_groups, target_indices, sampling_groups
         ):
             space_group = int(space_group)
-            degrees = get_degrees_of_freedom(space_group, self.device)
+            degrees = get_degrees_of_freedom(space_group)
             num_zero = int((degrees == 0).sum())
             num_inf = int((degrees != 0).sum())
             graph = create_wyckoff_graph(
                 space_group,
-                self.source_zero.sample((num_zero,)),
-                self.source_inf.sample((num_inf, self.num_elements)),
+                torch.zeros(num_zero, dtype=torch.long),
+                torch.zeros(num_inf, self.num_elements, dtype=torch.long),
             )
             graph.composition = composition.unsqueeze(0)
             if target_index is not None:
                 graph.target_index = torch.as_tensor(
                     target_index,
-                    device=self.device,
                     dtype=torch.long,
                 )
             if sampling_group is not None:
                 graph.sampling_group = torch.as_tensor(
                     sampling_group,
-                    device=self.device,
                     dtype=torch.long,
                 )
             graphs.append(graph)
-        return Batch.from_data_list(graphs)
+        data = Batch.from_data_list(graphs).to(self.device)
+        data.x_0_dof = self.source_zero.sample(data.x_0_dof.shape)
+        data.x_inf_dof = self.source_inf.sample(data.x_inf_dof.shape)
+        data.x = create_x_matrix(data.x_inf_dof, data.x_0_dof, data.zero_dof)
+        return data
 
     def _shared_step(self, batch, prefix):
         losses = self(batch)

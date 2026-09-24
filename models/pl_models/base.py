@@ -17,15 +17,13 @@ def resolve_config(config: Mapping[str, Any] | DictConfig) -> dict[str, Any]:
 class OptimizedLightningModule(pl.LightningModule):
     """Lightning module configured with a Hydra optimizer."""
 
-    def __init__(self, model_config, optimizer_config, task):
+    def __init__(self, optimizer_config, task):
         super().__init__()
-        self.model_config = resolve_config(model_config)
         self.optimizer_config = resolve_config(optimizer_config)
         self.task = task
         self.save_hyperparameters(
             {
                 "task": task,
-                "model_config": self.model_config,
                 "optimizer_config": self.optimizer_config,
             }
         )

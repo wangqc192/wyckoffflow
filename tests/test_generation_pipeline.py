@@ -1,10 +1,14 @@
 from pathlib import Path
 
+import pandas as pd
+import pytest
 import torch
 from torch_geometric.data import Data
 
 import models.generation_pipeline as pipeline
+import models.sampling as sampling
 from models.common.lookup_tables import chemical_symbols, wyckoff_label_to_index
+from models.pl_models.count_conserving import DecodingResult
 
 
 def wyckoff_graph(space_group, sites):
@@ -41,15 +45,19 @@ def test_diffcsp_template_combines_repeated_element_orbit_pairs():
     )
 
 
-def test_template_sampling_deduplicates_and_keeps_hierarchy_slots(monkeypatch):
+@pytest.mark.parametrize("sampling_mode", ["n-shot", "greedy"])
+def test_template_sampling_deduplicates_and_keeps_hierarchy_slots(
+    monkeypatch, sampling_mode
+):
     ga_te_194 = wyckoff_graph(194, [("f", "Ga", 1), ("f", "Te", 1)])
     ga_only_194 = wyckoff_graph(194, [("f", "Ga", 1)])
     ga_te_225 = wyckoff_graph(225, [("a", "Ga", 1), ("b", "Te", 1)])
 
-    def fake_sample(model, formula, space_group, pool_size, *, flow_steps):
+    def fake_sample(model, formula, space_group, pool_size, *, flow_steps, **kwargs):
         assert formula == "Ga4Te4"
         assert pool_size == 16
         assert flow_steps == 7
+        assert kwargs["sampling_mode"] == sampling_mode
         if space_group == 194:
             return [ga_te_194, ga_te_194.clone(), ga_only_194]
         return [ga_te_225]
@@ -62,6 +70,7 @@ def test_template_sampling_deduplicates_and_keeps_hierarchy_slots(monkeypatch):
         templates_per_space_group=4,
         template_pool_size=16,
         flow_steps=7,
+        sampling_mode=sampling_mode,
     )
 
     assert [row["candidate_index"] for row in rows] == [0, 4]
@@ -107,15 +116,16 @@ def test_top_n_batch_preserves_target_groups_and_indices(monkeypatch):
         num_elements = 118
         max_num_atoms = 8
 
-        def sample_logits(self, batch, *, flow_steps):
+        def sample_logits(self, batch, *, flow_steps, greedy):
+            assert greedy is False
             assert batch.target_index.tolist() == [10, 10, 20]
             assert batch.sampling_group.tolist() == [0, 1, 2]
             return batch, None, None
 
     def fake_decode(data, zero_logits, inf_logits, max_num_atoms, **kwargs):
-        return data.to_data_list(), 3, []
+        return DecodingResult(data.to_data_list(), [])
 
-    monkeypatch.setattr(pipeline, "sample_batch_to_compositions", fake_decode)
+    monkeypatch.setattr(sampling, "decode_composition_logits", fake_decode)
     sampled = pipeline._sample_record_batch(
         FakeModel(), records, 2, flow_steps=1, sampling_mode="top-n"
     )
@@ -124,3 +134,68 @@ def test_top_n_batch_preserves_target_groups_and_indices(monkeypatch):
     assert [record["generated_space_group"] for record, _ in sampled] == [194, 225, 194]
     assert [int(samples[0].target_index) for _, samples in sampled] == [10, 10, 20]
     assert [int(samples[0].sampling_group) for _, samples in sampled] == [0, 1, 2]
+
+
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("sampling_mode", ["top-n", "greedy"])
+def test_template_ranking_in_both_entry_points(monkeypatch, batched, sampling_mode):
+    high = wyckoff_graph(194, [("f", "Ga", 1), ("f", "Te", 1)])
+    low = wyckoff_graph(194, [("e", "Ga", 1), ("f", "Te", 1)])
+    high.candidate_rank = torch.tensor(1)
+    high.decoder_log_score = torch.tensor(-0.1)
+    low.candidate_rank = torch.tensor(2)
+    low.decoder_log_score = torch.tensor(-2.0)
+    samples = [high, low] if sampling_mode == "top-n" else [high, high.clone(), low]
+
+    if batched:
+
+        def fake_batch(model, records, num_samples, **kwargs):
+            assert kwargs["sampling_mode"] == sampling_mode
+            assert num_samples == (2 if sampling_mode == "top-n" else 3)
+            return [(record, samples) for record in records]
+
+        monkeypatch.setattr(pipeline, "_sample_record_batch", fake_batch)
+        model = type("FakeModel", (), {"max_num_atoms": 8})()
+        targets = pd.DataFrame([{"target_index": 0, "formula": "Ga4Te4"}])
+        predictions = pd.DataFrame(
+            [
+                {
+                    "target_index": 0,
+                    "Spacegroup Number": 194,
+                    "SG_Rank": 1,
+                    "SG_Prob": 1.0,
+                }
+            ]
+        )
+        rows = pipeline.sample_wyckoff_templates_for_targets(
+            model,
+            targets,
+            predictions,
+            templates_per_space_group=2,
+            template_pool_size=3,
+            flow_steps=1,
+            sampling_mode=sampling_mode,
+        )
+    else:
+
+        def fake_single(model, formula, space_group, num_samples, **kwargs):
+            assert kwargs["sampling_mode"] == sampling_mode
+            assert num_samples == (2 if sampling_mode == "top-n" else 3)
+            return samples
+
+        monkeypatch.setattr(pipeline, "_sample_one_space_group", fake_single)
+        rows = pipeline.sample_wyckoff_templates(
+            object(),
+            "Ga4Te4",
+            [194],
+            templates_per_space_group=2,
+            template_pool_size=3,
+            flow_steps=1,
+            sampling_mode=sampling_mode,
+        )
+    assert [row["template_rank"] for row in rows] == [1, 2]
+    assert [int(row["sample"].candidate_rank) for row in rows] == [1, 2]
+    assert [row["frequency"] for row in rows] == (
+        [1, 1] if sampling_mode == "top-n" else [2, 1]
+    )
+    assert rows[0]["generated_structure_sequence"] == "194-4f-Ga-4f-Te"

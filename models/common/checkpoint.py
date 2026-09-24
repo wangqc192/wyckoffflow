@@ -8,6 +8,8 @@ from omegaconf import OmegaConf
 
 def load_model(model_path, load_data=False, testing=True, device="cpu"):
     model_path = Path(model_path)
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model path does not exist: {model_path}")
     if model_path.is_file():
         checkpoint_path = model_path
         model_path = (
@@ -19,15 +21,14 @@ def load_model(model_path, load_data=False, testing=True, device="cpu"):
         checkpoint_dir = model_path / "checkpoints"
         checkpoint_path = checkpoint_dir / "last.ckpt"
         if not checkpoint_path.exists():
-            checkpoint_path = sorted(checkpoint_dir.glob("*.ckpt"))[-1]
+            checkpoints = sorted(checkpoint_dir.glob("*.ckpt"))
+            if not checkpoints:
+                raise FileNotFoundError(f"No checkpoints found in: {checkpoint_dir}")
+            checkpoint_path = checkpoints[-1]
 
     config = OmegaConf.load(model_path / "hparams.yaml")
-    model = hydra.utils.instantiate(
-        config.model,
-        optimizer_config=config.optim,
-        _recursive_=False,
-    )
-    model = type(model).load_from_checkpoint(
+    model_class = hydra.utils.get_class(config.model._target_)
+    model = model_class.load_from_checkpoint(
         checkpoint_path,
         map_location=device,
         strict=True,

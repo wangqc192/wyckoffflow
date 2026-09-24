@@ -34,6 +34,7 @@ from models.generation_pipeline import (  # noqa: E402
     sample_wyckoff_templates,
     write_selected_queries,
 )
+from models.sampling import SAMPLING_MODES  # noqa: E402
 
 
 def resolve_device(choice: str) -> str:
@@ -243,7 +244,7 @@ def main(args: argparse.Namespace) -> None:
         raise RuntimeError("NextCrystal did not return enough valid space groups")
 
     print("[2/3] Wyckoff template generation", flush=True)
-    flow_model, flow_config = load_flow_model(args.flow_checkpoint, device)
+    flow_model, _ = load_flow_model(args.flow_checkpoint, device)
     rows = sample_wyckoff_templates(
         flow_model,
         args.formula,
@@ -262,11 +263,6 @@ def main(args: argparse.Namespace) -> None:
     selected_json = output_dir / "diffcsp_queries.json"
     write_selected_queries(rows, selected_json)
 
-    effective_flow_steps = (
-        args.flow_steps
-        if args.flow_steps is not None
-        else int(flow_config.model.model_config.flow_steps)
-    )
     run_metadata = {
         "formula": args.formula,
         "seed": args.seed,
@@ -274,7 +270,7 @@ def main(args: argparse.Namespace) -> None:
         "nextcrystal_root": str(args.nextcrystal_root.resolve()),
         "nextcrystal_checkpoint": str(args.nextcrystal_checkpoint.resolve()),
         "flow_checkpoint": str(args.flow_checkpoint.resolve()),
-        "flow_steps": effective_flow_steps,
+        "flow_steps": args.flow_steps,
         "space_group_top_k": args.space_group_top_k,
         "templates_per_space_group": args.templates_per_space_group,
         "template_pool_size": args.template_pool_size,
@@ -380,11 +376,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--template-pool-size", type=int, default=16)
     parser.add_argument(
         "--sampling-mode",
-        choices=("n-shot", "top-n"),
+        choices=SAMPLING_MODES,
         default="n-shot",
-        help="n-shot samples with replacement; top-n returns distinct templates",
+        help=(
+            "n-shot samples random trajectories; top-n searches distinct templates; "
+            "greedy takes argmax at each step and decodes one template per trajectory"
+        ),
     )
-    parser.add_argument("--flow-steps", type=int)
+    parser.add_argument(
+        "--flow-steps",
+        type=int,
+        default=100,
+        help="number of inference flow steps (default: 100)",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     parser.add_argument(

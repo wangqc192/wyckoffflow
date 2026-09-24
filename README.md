@@ -5,6 +5,88 @@
 本文档中的文件命名约定：CrystalFlow 使用 `diffcsp`；DiffCSP++ 使用 `diffcsppp`。
 命令中的 `<model_path>`、`<dataset>`、`<input_csv>` 等表示需要替换为实际路径或名称的参数。
 
+## 训练中的验证集模板重建率
+
+`uv run python -m models.run` 默认在完成第 100、200、300…个 epoch 时，
+对完整验证集计算模板重建率。使用真实空间群和完整组成、50 步、20 次 n-shot
+采样，同一批 flow 轨迹的末步 logits 分别进行组成守恒解码和无计数约束的
+categorical 采样。按 `eval_gwa.py` 相同的等价模板口径记录：
+
+| 指标 | 计数守恒开启 | 计数守恒关闭 |
+| --- | --- | --- |
+| GWA@1 | `val/gwa_top1` | `val/gwa_top1_no_composition` |
+| GWA@20 | `val/gwa_top20` | `val/gwa_top20_no_composition` |
+| 组成正确率 | `val/composition_accuracy` | `val/composition_accuracy_no_composition` |
+
+组成正确率为完整晶胞各元素计数正确的样本数 / 请求的样本总数；空模板、错误组成
+及漏生成均计入未命中，不筛选或补采样。关闭计数守恒仍保留化学式条件和元素掩码。
+这里评估的是 Wyckoff 模板重建，不调用结构生成模型。
+
+每次评估保存到训练目录的 `reconstruction/epoch_0099/` 等目录中
+（目录编号为零基 epoch，`0099` 对应第 100 轮）：
+
+- `summary.json`：重建率、轮次、随机种子和采样参数；
+- `details.csv`：逐材料命中情况；
+- `samples.csv`：所有生成候选，保留重复模板；
+- `no_composition/`：关闭计数守恒的同名三份文件；根目录 `summary.json` 也包含这组指标。
+
+最佳检查点的文件名包含零基 epoch 编号，例如第 100 轮对应 `0099`：
+
+- `checkpoints/best_epoch_0099.ckpt`：按验证 loss 选择；
+- `checkpoints/best_gwa_epoch_0099.ckpt`：按开启计数守恒时的验证 GWA@20 选择；
+- `checkpoints/best_gwa_no_composition_epoch_0099.ckpt`：按关闭计数守恒时的验证 GWA@20 选择。
+
+默认每类只保留一个最佳检查点；出现更优结果时，保存新文件并移除该类旧的最佳文件。
+每 100 轮的 `epoch_*.ckpt` 和用于断点续训的 `last.ckpt` 也照常保存。
+两组评估共用一次 flow 前向过程；额外的无约束采样不改变后续 flow 的随机数。
+评估固定随机种子，
+结束后恢复训练 RNG 状态。多 GPU 训练时由 rank 0 评估完整验证集并同步指标。
+
+参数可通过 Hydra 覆盖，例如：
+
+```bash
+uv run python -m models.run \
+  train.reconstruction.every_n_epochs=100 \
+  train.reconstruction.num_samples=20 \
+  train.reconstruction.flow_steps=50
+```
+
+`train.reconstruction.batch_size=128` 限制每批轨迹总数（含重复采样），
+`train.reconstruction.cpu_workers=8` 控制解码进程数。
+使用 `train.reconstruction.enabled=false` 可关闭；空间群分类实验默认关闭。
+修改配置后需启动或恢复训练，已经运行的训练进程不会自动加载新回调。
+
+## 图网络配置与消融
+
+参考 DiffCSP，decoder 使用独立的 Hydra 配置组
+`conf/model/decoder/`，默认是 `wyckoff_gnn.yaml`。网络层数、隐藏维度、
+组成编码、FiLM 和 MLP 等参数放在 `model.decoder` 中；source、损失权重等
+直接放在 `model` 中，例如
+`model.zero_df_loss_weight=2.0` 和 `model.inf_df_loss_weight=1.0`。
+
+~~~bash
+uv run python -m models.run \
+  model/decoder=wyckoff_gnn \
+  model.decoder.num_gnn_layers=6 \
+  model.decoder.hidden_dim=512
+
+# 对层数和 FiLM 做组合消融
+uv run python -m models.run --multirun \
+  model.decoder.num_gnn_layers=2,3,6 \
+  model.decoder.composition_film=true,false
+~~~
+
+新增图网络时，在 `conf/model/decoder/<name>.yaml` 中配置该网络的 `_target_`
+和参数，再用 `model/decoder=<name>` 切换。flow 自动向构造函数传入
+`num_elements`、`max_num_atoms`、`conditional_composition` 和 `continuous_time=True`。
+decoder 的 `forward(data, time)` 应返回 `(zero_logits, inf_logits)`，形状分别为
+`[零自由度节点数, num_elements + 1]` 和
+`[非零自由度节点数, num_elements, max_num_atoms + 1]`。
+
+新增的 `crystal_gnn` 使用 Wyckoff 对称性描述符、组成残差、多头图注意力和
+跨元素共享计数预测头。用 `model/decoder=crystal_gnn` 启动独立训练；
+设计、消融和评估口径见 [CrystalGNN 说明](docs/crystal_gnn.md)。
+
 ## 模型评估
 
 评估模型并计算指标：
@@ -30,9 +112,71 @@ uv run python scripts/compute_metrics_crystalflow.py \
 uv run python scripts/sample_wy.py \
   --model_path <model_path> \
   --formula_file <formula_file> \
-  --num_evals 20 \
+  --num-samples 20 \
   --batch_size 128 \
+  --flow_steps 100 \
   --save_path outputs/flow_samples
+~~~
+
+采样步数由采样命令指定，默认 100，不保存到模型配置或训练检查点中。
+`sample_wy.py` 使用 `--flow_steps`，`generate_structure.py` 使用 `--flow-steps`；
+`sample_and_eval_gwa.sh` 的第四个位置参数为采样步数。
+
+采样过程统一由 `models/sampling.py` 组织：构造条件与 flow 轨迹 → 模型返回
+末步 logits → 解码模板。模型不保存采样次数或组成守恒开关。
+
+| 采样参数 | 含义 |
+| --- | --- |
+| `--num-samples` | 每个公式/空间群条件请求的输出样本数 |
+| `--sampling-mode n-shot` | 每个样本运行一条随机 flow 轨迹，再做随机解码 |
+| `--sampling-mode top-n` | 每个条件运行一条随机 flow 轨迹，再搜索多个候选 |
+| `--sampling-mode greedy` | 每个样本独立初始化，逐步取 decoder 的 argmax，再做确定性解码 |
+| `--enforce-composition` / `--no-enforce-composition` | 是否使用组成守恒解码，默认开启；top-n 必须开启 |
+| `--fixed-site-beam-size` | 固定 Wyckoff 位点的搜索束宽，默认 `max(256, 8*num_samples)` |
+
+评估模型自身的随机生成效果，使用 `--sampling-mode n-shot --no-enforce-composition`。
+该组合保留随机 flow 轨迹，末步按各变量的 categorical 分布抽样，不做组分守恒的
+DP/束搜索。化学式条件和元素种类掩码仍然保留，各元素的原子总数由模型自行预测。
+一键采样评估脚本也支持该组合，例如使用真实空间群评估 MP20 测试集：
+
+~~~bash
+bash scripts/sample_and_eval_gwa.sh \
+  <model_path> 20 eval/nshot_no_composition 50 \
+  example/input_test_origin.csv data/mp20/test.csv \
+  --sampling-mode n-shot --no-enforce-composition
+~~~
+
+导出和 GWA 评估保留组分错误及空模板，不筛选或补采样；空模板的 `formula` 为空，
+`wyckoff_occupancy` 仅记录空间群编号，作为未命中计入评估。
+
+内部用 `num_trajectories` 表示 flow 轨迹数，和输出样本数区分。
+`--num_evals`、`--count_conserving`、`--topn-beam-size` 仍可作为上述参数的旧别名。
+CrystalFlow 输入 CSV 中的 `num_evals` 属于外部格式，沿用其原名称。
+
+`--reuse-logits` 只运行解码，不加载模型；未指定的模式、样本数和束宽沿用缓存。
+top-n 可以重新指定 `--num-samples`，输出元数据记录实际生效值；n-shot 和 greedy 的轨迹数
+已由缓存确定，改变样本数需要重新运行 flow。
+
+解码结果统一为 `DecodingResult(samples, infeasible_graph_indices)`，不原地修改
+flow 状态；不可行输入按索引返回并跳过，不拆批重新运行模型。
+top-n 保留 decoder 排名；n-shot 和 greedy 的模板频次排序由结构生成流程单独处理。
+top-n 是基于末步 logits 的候选搜索，前面的 flow 仍然随机；有限束宽也不保证
+得到完整生成分布的精确前 N 名。
+
+greedy 在每一步直接取经过元素掩码的 decoder logits 的 argmax，不使用随机跳转。
+最后开启组成约束时，使用无随机扰动的 DP/束搜索选择一个组成守恒模板；关闭约束时
+直接逐变量取 argmax。`--num-samples` 对应独立初态的数量，允许重复；当前默认
+`flow_source: zeros` 的初态相同，因此同一条件会得到重复结果，通常设为 1。
+使用 `uniform` 或 `marginal` 先验时，初态仍有随机性。三个采样入口均支持
+`--sampling-mode greedy`，例如：
+
+~~~bash
+uv run python scripts/sample_wy.py \
+  --model_path <model_path> \
+  --formula_file <formula_file> \
+  --sampling-mode greedy \
+  --num-samples 1 \
+  --save_path outputs/greedy_samples
 ~~~
 
 输出 `outputs/flow_samples.pt`，再解码为可读模板：
@@ -47,6 +191,8 @@ CSV 主要包含：
 
 - `sample_index`
 - `target_index`
+- `candidate_rank`
+- `decoder_log_score`（有约束解码的末步类别对数分数，替代 `candidate_probability`）
 - `space_group`
 - `formula`
 - `target_formula`
@@ -60,9 +206,13 @@ target_index,space_group,formula,target_formula,wyckoff_occupancy,count
 0,216,Ga4Te4,Ga4Te4,216_Ga1x4d_Te1x4a,1
 ~~~
 
-该步骤完成 Wyckoff 图解码、完整晶胞组成检查和组成守恒，并保留每一个采样结果，
+组成守恒在采样解码阶段完成（默认开启）。导出步骤解码 Wyckoff 图，并保留每一个采样结果，
 不对重复模板去重；`count` 对每一行固定为 `1`。公式使用完整的
 conventional-cell 计量，不会自动约分，例如 `Ga4Te4` 不会变成 `GaTe`。
+
+`decoder_log_score` 是给定末步 flow 状态时各类别 log probability 的和，
+不代表对所有 flow 轨迹积分后的模板概率；使用对数避免很小的概率下溢。
+输出中的 `gpu_flow_time` 和 `cpu_decode_time` 分别记录 flow 与解码耗时。
 
 ### 2. WyckoffFlow 模板 → CrystalFlow
 

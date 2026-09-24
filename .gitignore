@@ -15,4 +15,4 @@ results/*
 *.ipynb
 AGENTS.md
 DEVELOPMENT_LOG.md
-
+artifacts/

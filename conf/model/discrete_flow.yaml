@@ -1,25 +1,14 @@
+defaults:
+  - decoder: wyckoff_gnn
+  - _self_
+
 _target_: models.pl_models.flow.DiscreteFlowModule
 
-model_config:
-  num_elements: ${data.num_elements}
-  max_num_atoms: 54
-  flow_source: zeros
-  flow_steps: 100
-  loss_weights:
-    zero_df: 1.0
-    inf_df: 1.0
-  conditional_composition: true
-  composition_encoder_dim: 256
-  composition_film: true
-  count_conserving: false
-  num_gnn_layers: 3
-  hidden_dim: 256
-  dof_pos_sg_emb_size: 128
-  gnn_activation: SiLU
-  no_multiplicity_encoding: false
-  binary_dof_encoding: false
-  no_softmax: false
-  mlp_hidden_layers: 2
-  mlp_activation: SiLU
+num_elements: ${data.num_elements}
+max_num_atoms: 54
+flow_source: zeros
+zero_df_loss_weight: 1.0
+inf_df_loss_weight: 1.0
+conditional_composition: true
 
 validation_seed: ${seed}

@@ -21,6 +21,7 @@ def test_occupancy_key_ignores_order_but_preserves_counts():
 
 def test_occupancy_key_accepts_numeric_csv_values():
     assert occupancy_key(194) == ("194",)
+    assert occupancy_key("194") == ("194",)
 
 
 def test_target_occupancy_keys_include_equivalent_settings():

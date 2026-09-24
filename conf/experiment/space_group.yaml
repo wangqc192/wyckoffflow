@@ -5,5 +5,7 @@ defaults:
 
 experiment_name: space_group
 train:
+  reconstruction:
+    enabled: false
   trainer:
     max_epochs: 200

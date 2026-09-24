@@ -8,16 +8,23 @@ from .spg_predictor import SpaceGroupPredictor
 
 
 class SpaceGroupModule(OptimizedLightningModule):
-    def __init__(self, model_config, optimizer_config):
-        super().__init__(model_config, optimizer_config, "space_group")
-        config = self.model_config
-        self.num_elements = config["num_elements"]
-        self.max_num_atoms = config["max_num_atoms"]
-        self.use_feasibility_mask = config.get(
-            "compatibility",
-            config.get("spg_compatibility", False),
-        )
-        self.predictor = SpaceGroupPredictor(config)
+    def __init__(
+        self,
+        optimizer_config,
+        num_elements,
+        max_num_atoms,
+        hidden_dim,
+        mlp_hidden_layers,
+        mlp_activation,
+        composition_encoder_dim=None,
+        compatibility=False,
+    ):
+        super().__init__(optimizer_config, "space_group")
+        self.save_hyperparameters(ignore=["optimizer_config"])
+        self.num_elements = num_elements
+        self.max_num_atoms = max_num_atoms
+        self.use_feasibility_mask = compatibility
+        self.predictor = SpaceGroupPredictor(self.hparams)
 
     def forward(self, batch):
         composition = batch.composition

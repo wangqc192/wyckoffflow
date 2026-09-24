@@ -9,27 +9,29 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning.callbacks import ModelCheckpoint
 
+from models.common.reconstruction import ValidationReconstruction
 from models.common.utils import PROJECT_ROOT
 
 log = logging.getLogger(__name__)
 
 
-def build_callbacks(config: DictConfig) -> list[ModelCheckpoint]:
+def build_callbacks(config: DictConfig) -> list[pl.Callback]:
     checkpoint = config.train.checkpoint
     directory = (
         Path(config.resume_from).resolve().parent
         if config.resume_from
         else Path(HydraConfig.get().runtime.output_dir) / "checkpoints"
     )
-    return [
+    callbacks = [
         ModelCheckpoint(
             dirpath=directory,
-            filename="best",
+            filename="best_epoch_{epoch:04d}",
             monitor=checkpoint.monitor,
             mode=checkpoint.mode,
             save_top_k=checkpoint.save_top_k,
             save_last=checkpoint.save_last,
             enable_version_counter=False,
+            auto_insert_metric_name=False,
         ),
         ModelCheckpoint(
             dirpath=directory,
@@ -40,6 +42,39 @@ def build_callbacks(config: DictConfig) -> list[ModelCheckpoint]:
             auto_insert_metric_name=False,
         ),
     ]
+    reconstruction = config.train.reconstruction
+    if reconstruction.enabled:
+        callbacks.extend(
+            [
+                ValidationReconstruction(
+                    output_dir=directory.parent / "reconstruction",
+                    **{k: v for k, v in reconstruction.items() if k != "enabled"},
+                ),
+                ModelCheckpoint(
+                    dirpath=directory,
+                    filename="best_gwa_epoch_{epoch:04d}",
+                    monitor=f"val/gwa_top{reconstruction.num_samples}",
+                    mode="max",
+                    save_top_k=1,
+                    every_n_epochs=reconstruction.every_n_epochs,
+                    save_on_train_epoch_end=False,
+                    enable_version_counter=False,
+                    auto_insert_metric_name=False,
+                ),
+                ModelCheckpoint(
+                    dirpath=directory,
+                    filename="best_gwa_no_composition_epoch_{epoch:04d}",
+                    monitor=f"val/gwa_top{reconstruction.num_samples}_no_composition",
+                    mode="max",
+                    save_top_k=1,
+                    every_n_epochs=reconstruction.every_n_epochs,
+                    save_on_train_epoch_end=False,
+                    enable_version_counter=False,
+                    auto_insert_metric_name=False,
+                ),
+            ]
+        )
+    return callbacks
 
 
 def run(config: DictConfig) -> None:

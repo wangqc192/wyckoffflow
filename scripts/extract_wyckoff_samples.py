@@ -39,8 +39,6 @@ def _canonical_occupancy(space_group: int, entries: list[tuple[str, str]]) -> st
 
 
 def _decode_sample(sample) -> dict[str, object]:
-    template = WyckoffTemplate.from_model_output(sample)
-
     target_counts = getattr(sample, "composition", None)
     target_formula = ""
     if target_counts is not None:
@@ -53,6 +51,18 @@ def _decode_sample(sample) -> dict[str, object]:
             }
         )
 
+    # Unconstrained sampling can leave every site empty. Keep it as a failed
+    # sample so evaluation still includes all requested trajectories.
+    if not sample.x.any():
+        space_group = _scalar(sample.space_group)
+        return {
+            "space_group": space_group,
+            "formula": "",
+            "target_formula": target_formula,
+            "wyckoff_occupancy": str(space_group),
+        }
+
+    template = WyckoffTemplate.from_model_output(sample)
     return {
         "space_group": template.spacegroup_number,
         "formula": template.formula,
@@ -64,7 +74,8 @@ def _decode_sample(sample) -> dict[str, object]:
 def _top_k(payload, override):
     if override is not None:
         return override
-    return int(payload["args"]["num_evals"])
+    settings = payload["args"]
+    return int(settings.get("num_samples", settings.get("num_evals", 1)))
 
 
 def extract_samples(
@@ -90,9 +101,9 @@ def extract_samples(
             if hasattr(sample, "candidate_rank")
             else index % top_k + 1
         )
-        candidate_probability = (
-            float(sample.candidate_probability.reshape(-1)[0].item())
-            if hasattr(sample, "candidate_probability")
+        decoder_log_score = (
+            float(sample.decoder_log_score.reshape(-1)[0].item())
+            if hasattr(sample, "decoder_log_score")
             else None
         )
         rows.append(
@@ -100,7 +111,7 @@ def extract_samples(
                 "sample_index": index,
                 "target_index": target_index,
                 "candidate_rank": candidate_rank,
-                "candidate_probability": candidate_probability,
+                "decoder_log_score": decoder_log_score,
                 **_decode_sample(sample),
                 "count": 1,
             }
@@ -113,7 +124,7 @@ def write_csv(rows: list[dict[str, object]], output_path: str | Path) -> None:
         "sample_index",
         "target_index",
         "candidate_rank",
-        "candidate_probability",
+        "decoder_log_score",
         "space_group",
         "formula",
         "target_formula",
