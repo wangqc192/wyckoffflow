@@ -5,6 +5,34 @@
 本文档中的文件命名约定：CrystalFlow 使用 `diffcsp`；DiffCSP++ 使用 `diffcsppp`。
 命令中的 `<model_path>`、`<dataset>`、`<input_csv>` 等表示需要替换为实际路径或名称的参数。
 
+## 实验目录命名
+
+训练目录自动包含实验类型、实验标签、数据配置、网络结构和关键训练参数，例如：
+
+```text
+outputs/2026-09-28/09-56-08_discrete_flow_baseline_mp20_crystal_gnn_h256_l4_bs256_lr0.0001_wd0.0_ep1000_s42/
+```
+
+`h` / `l` 分别是网络隐藏维度 / 层数，`bs` 是单设备训练 batch size，
+`lr` / `wd` 是学习率 / weight decay，`ep` 是最大训练轮数，`s` 是 seed。
+空间群分类使用 `sg_mlp` 并显示组成编码维度 `c`；联合训练额外显示
+SG / Flow 损失权重 `sgw` / `floww`。这些数值随实际配置自动更新。
+
+用 `run_tag` 标明实验目的或未列入目录名的消融参数，默认为空：
+
+```bash
+uv run python -m models.run \
+  run_tag=no_film model.decoder.composition_film=false
+
+uv run python -m models.run --multirun \
+  run_tag=capacity model.decoder.num_gnn_layers=3,6 model.decoder.hidden_dim=256,512
+```
+
+标签建议只使用字母、数字、下划线和连字符。多参数扫描中，每个子目录采用
+`序号_完整实验名`。目录名展示关键参数，全部生效配置保存在 `hparams.yaml`，
+命令行覆盖保存在 `.hydra/overrides.yaml`；其他消融开关需通过标签说明。
+仍可用 `hydra.run.dir=...` 显式指定输出路径。
+
 ## 训练中的验证集模板重建率
 
 `uv run python -m models.run` 默认在完成第 100、200、300…个 epoch 时，
@@ -56,6 +84,26 @@ uv run python -m models.run \
 使用 `train.reconstruction.enabled=false` 可关闭；空间群分类实验默认关闭。
 修改配置后需启动或恢复训练，已经运行的训练进程不会自动加载新回调。
 
+画训练和重建曲线：
+
+```bash
+# 单个实验：自动合并其 resume_*/logs/metrics.csv
+uv run python scripts/plot_loss.py outputs/2026-09-24/09-56-08_discrete_flow
+
+# 批量处理 outputs 下的实验（含 old），每个实验保存到 logs/loss.png
+uv run python scripts/plot_loss.py outputs
+```
+
+脚本按已有指标显示训练/验证 loss、GWA@1/@K 和组成正确率，区分开启/关闭
+计数守恒；联合模型还显示任务 loss、空间群准确率和预测空间群后的重建结果。
+重建指标优先使用 `reconstruction/epoch_*/summary.json` 中的等价模板评估结果，
+缺少 summary 时使用 CSV 指标；只在实际评估轮次画点，不填充未评估轮次。
+横轴为已完成轮数（零基 epoch + 1），准确率显示为百分比。loss 纵轴按各条
+曲线的最小值到 95% 分位数取并集，并留 5% 边距；初期高值可能超出显示范围，
+以突出主要训练阶段的变化。
+也可传入 `logs` 目录或 `metrics.csv` 只读取该份日志；单个实验可用
+`--output path/to/figure.png` 指定图片路径。绘图不依赖 LaTeX 或 SciencePlots。
+
 ## 图网络配置与消融
 
 参考 DiffCSP，decoder 使用独立的 Hydra 配置组
@@ -83,9 +131,18 @@ decoder 的 `forward(data, time)` 应返回 `(zero_logits, inf_logits)`，形状
 `[零自由度节点数, num_elements + 1]` 和
 `[非零自由度节点数, num_elements, max_num_atoms + 1]`。
 
+`mlp_hidden_layers` 直接表示隐藏层数，不包括最终 Linear 输出层。
+当前默认值为 3，保持原网络深度。历史配置采用“额外隐藏层数”语义，复用时需将
+旧值加 1；旧 checkpoint 内嵌的对应配置（`sg_head`、`decoder` 或独立 SG 的顶层
+`mlp_hidden_layers`）也需同步修改或在加载时覆盖，仅修改 `conf/` 不会更新这些值。
+
 新增的 `crystal_gnn` 使用 Wyckoff 对称性描述符、组成残差、多头图注意力和
 跨元素共享计数预测头。用 `model/decoder=crystal_gnn` 启动独立训练；
 设计、消融和评估口径见 [CrystalGNN 说明](docs/crystal_gnn.md)。
+
+使用 `uv run python -m models.run experiment=joint` 可联合训练空间群预测与
+CrystalGNN 占位流，共享静态成分编码器。训练、联合评估和仅给定成分的采样命令见
+[联合训练说明](docs/joint_training.md)。
 
 ## 模型评估
 

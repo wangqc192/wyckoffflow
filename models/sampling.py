@@ -38,6 +38,31 @@ def make_condition(formula, space_group, num_elements, target_index):
     )
 
 
+@torch.inference_mode()
+def predict_space_group_conditions(model, compositions, target_indices, top_k):
+    """Build feasible conditions in target order, then descending SG probability."""
+    if not 1 <= top_k <= 230:
+        raise ValueError("space-group top_k must be in 1..230")
+    probabilities = model.predict_space_groups(compositions)
+    scores, groups = probabilities.topk(top_k, dim=-1)
+    conditions = []
+    for composition, target_index, row_scores, row_groups in zip(
+        compositions.cpu(), target_indices, scores.cpu(), groups.cpu()
+    ):
+        for score, group in zip(row_scores, row_groups):
+            if score <= 0:
+                continue
+            conditions.append(
+                SamplingData(
+                    formula=composition.unsqueeze(0),
+                    space_group=group,
+                    target_index=torch.tensor(int(target_index)),
+                    sampling_group=torch.tensor(len(conditions)),
+                )
+            )
+    return conditions
+
+
 def _num_trajectories(num_samples, sampling_mode):
     if num_samples <= 0:
         raise ValueError("num_samples must be positive")

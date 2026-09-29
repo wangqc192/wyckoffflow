@@ -78,6 +78,19 @@ class DiscreteFlowModule(OptimizedLightningModule):
         )
 
     def forward(self, batch):
+        return self.flow_loss(batch, self.encode_composition(batch.composition))
+
+    def encode_composition(self, composition):
+        """Joint models override this to share static features across tasks and steps."""
+        return None
+
+    def decode(self, data, time, composition_features):
+        if composition_features is None:
+            return self.decoder(data, time)
+        return self.decoder(data, time, composition_features=composition_features)
+
+    def flow_loss(self, batch, composition_features=None):
+        """Corrupt occupations and train the decoder against the clean template."""
         data_t = batch.clone()
         batch_size = batch.num_graphs
         time = torch.rand(batch_size, device=self.device)
@@ -104,7 +117,7 @@ class DiscreteFlowModule(OptimizedLightningModule):
             data_t.zero_dof,
         )
 
-        zero_logits, inf_logits = self.decoder(data_t, time)
+        zero_logits, inf_logits = self.decode(data_t, time, composition_features)
         zero_logits, inf_logits, allowed = self._mask_logits(
             zero_logits,
             inf_logits,
@@ -210,13 +223,14 @@ class DiscreteFlowModule(OptimizedLightningModule):
         inf_mask = (~allowed[:, 1:][data_t.batch[inf_indices]]).unsqueeze(-1) & (
             torch.arange(self.max_num_atoms + 1, device=self.device) > 0
         )
+        composition_features = self.encode_composition(data_t.composition)
         for step in range(flow_steps):
             time = torch.full(
                 (data_t.num_graphs,),
                 step / flow_steps,
                 device=self.device,
             )
-            zero_logits, inf_logits = self.decoder(data_t, time)
+            zero_logits, inf_logits = self.decode(data_t, time, composition_features)
             zero_logits = zero_logits.masked_fill(zero_mask, float("-inf"))
             inf_logits = inf_logits.masked_fill(inf_mask, float("-inf"))
             if step == flow_steps - 1:

@@ -47,7 +47,7 @@ def test_decoder_overrides_support_forward_and_backward():
         "model.decoder.hidden_dim=8",
         "model.decoder.dof_pos_sg_emb_size=4",
         "model.decoder.composition_encoder_dim=4",
-        "model.decoder.mlp_hidden_layers=1",
+        "model.decoder.mlp_hidden_layers=2",
         "model.max_num_atoms=8",
         "model.zero_df_loss_weight=2.0",
         "model.inf_df_loss_weight=3.0",

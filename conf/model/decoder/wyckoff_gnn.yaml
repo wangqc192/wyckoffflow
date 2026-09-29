@@ -9,5 +9,5 @@ composition_film: true
 no_multiplicity_encoding: false
 binary_dof_encoding: false
 no_softmax: false
-mlp_hidden_layers: 2
+mlp_hidden_layers: 3
 mlp_activation: SiLU

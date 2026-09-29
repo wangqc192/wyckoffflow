@@ -63,7 +63,7 @@ def small_model():
             "dof_pos_sg_emb_size": 4,
             "num_gnn_layers": 1,
             "gnn_activation": "SiLU",
-            "mlp_hidden_layers": 1,
+            "mlp_hidden_layers": 2,
             "mlp_activation": "SiLU",
             "composition_encoder_dim": 4,
         },

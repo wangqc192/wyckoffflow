@@ -45,7 +45,7 @@ DECODER_CONFIG = {
     "no_multiplicity_encoding": False,
     "binary_dof_encoding": False,
     "no_softmax": False,
-    "mlp_hidden_layers": 1,
+    "mlp_hidden_layers": 2,
     "mlp_activation": "SiLU",
 }
 

@@ -4,6 +4,7 @@ defaults:
   - override /model: space_group
 
 experiment_name: space_group
+model_label: sg_mlp_h${model.hidden_dim}_l${model.mlp_hidden_layers}_c${model.composition_encoder_dim}
 train:
   reconstruction:
     enabled: false

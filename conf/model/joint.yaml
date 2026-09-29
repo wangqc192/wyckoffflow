@@ -1,0 +1,26 @@
+defaults:
+  - decoder: crystal_gnn
+  - _self_
+
+_target_: models.pl_models.joint.JointSpaceGroupWyckoffModule
+
+num_elements: ${data.num_elements}
+max_num_atoms: 54
+flow_source: zeros
+conditional_composition: true
+validation_seed: ${seed}
+
+sg_loss_weight: 0.1
+flow_loss_weight: 1.0
+decay_matrix_weights_only: false
+flow_encoder_grad_scale: 1.0
+zero_df_loss_weight: 1.0
+inf_df_loss_weight: 1.0
+
+sg_head:
+  hidden_dim: ${model.decoder.hidden_dim}
+  mlp_hidden_layers: 3
+  mlp_activation: SiLU
+  compatibility: true
+  layer_norm: true
+  dropout: 0.1

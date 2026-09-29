@@ -8,6 +8,9 @@ defaults:
   - experiment: discrete_flow
 
 experiment_name: discrete_flow
+run_tag: ""
+model_label: ${hydra:runtime.choices.model/decoder}_h${model.decoder.hidden_dim}_l${model.decoder.num_gnn_layers}
+run_name: ${experiment_name}_${run_tag}_${hydra:runtime.choices.data}_${model_label}_bs${data.datamodule.batch_size.train}_lr${optim.lr}_wd${optim.weight_decay}_ep${train.trainer.max_epochs}_s${seed}
 seed: 42
 resume_from: null
 
@@ -16,9 +19,9 @@ paths:
 
 hydra:
   run:
-    dir: ${paths.output_dir}/${now:%Y-%m-%d}/${now:%H-%M-%S}_${experiment_name}
+    dir: ${paths.output_dir}/${now:%Y-%m-%d}/${now:%H-%M-%S}_${run_name}
   sweep:
     dir: ${paths.output_dir}/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}_${experiment_name}
-    subdir: ${hydra.job.num}
+    subdir: ${hydra.job.num}_${run_name}
   job:
     chdir: false

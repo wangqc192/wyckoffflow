@@ -9,12 +9,15 @@ import torch
 from torch_geometric.loader import DataLoader
 
 from models.common.checkpoint import load_model
+from models.common.composition import formula_to_counts
+from models.pl_models.chemical_sg import load_chemical_space_group_model
 from models.pl_models.count_conserving import DEFAULT_CPU_TASK_SIZE, DEFAULT_CPU_WORKERS
 from models.sampling import (
     SAMPLING_MODES,
     collect_flow_logits,
     decode_logit_batches,
     make_condition,
+    predict_space_group_conditions,
 )
 
 
@@ -162,16 +165,39 @@ def main(args):
         formulas, conditions = load_formula_tabular_file(args.formula_file)
     else:
         formulas, conditions = args.formula, [{}] * len(args.formula)
-    records = [
-        make_condition(
-            formula,
-            condition.get("space_group", args.space_group),
-            model.num_elements,
-            condition.get("target_index", index),
-        )
-        for index, (formula, condition) in enumerate(zip(formulas, conditions))
-    ]
     started = time.time()
+    if args.space_group_top_k is not None:
+        if args.space_group is not None or any("space_group" in c for c in conditions):
+            raise ValueError("choose either supplied or predicted space groups")
+        group_model = (
+            load_chemical_space_group_model(args.space_group_model_path, model.device)
+            if args.space_group_model_path
+            else model
+        )
+        records = []
+        for start in range(0, len(formulas), args.batch_size):
+            stop = min(start + args.batch_size, len(formulas))
+            compositions = torch.stack(
+                [formula_to_counts(f, model.num_elements) for f in formulas[start:stop]]
+            )
+            records.extend(
+                predict_space_group_conditions(
+                    group_model,
+                    compositions,
+                    [conditions[i].get("target_index", i) for i in range(start, stop)],
+                    args.space_group_top_k,
+                )
+            )
+    else:
+        records = [
+            make_condition(
+                formula,
+                condition.get("space_group", args.space_group),
+                model.num_elements,
+                condition.get("target_index", index),
+            )
+            for index, (formula, condition) in enumerate(zip(formulas, conditions))
+        ]
     logit_batches = collect_flow_logits(
         DataLoader(records, batch_size=args.batch_size),
         model,
@@ -211,6 +237,16 @@ def build_parser():
         help="samples per formula/space-group condition; default 1, or cached value on reuse",
     )
     parser.add_argument("--space_group", type=int)
+    parser.add_argument(
+        "--space-group-model-path",
+        help="optional chemical space-group checkpoint; used with --space-group-top-k",
+    )
+    parser.add_argument(
+        "--space-group-top-k",
+        type=int,
+        help="predict up to K feasible space groups using a joint checkpoint; "
+        "num-samples is the number of templates per selected group",
+    )
     parser.add_argument(
         "--sampling-mode",
         "--sampling_mode",
@@ -265,8 +301,10 @@ if __name__ == "__main__":
             parser.error("provide --model_path")
         if args.formula_file is None and not args.formula:
             parser.error("provide --formula or --formula_file")
-        if args.formula and args.space_group is None:
-            parser.error("provide --space_group with --formula")
+        if args.formula and args.space_group is None and args.space_group_top_k is None:
+            parser.error("provide --space_group or --space-group-top-k with --formula")
+        if args.space_group_model_path and args.space_group_top_k is None:
+            parser.error("--space-group-model-path requires --space-group-top-k")
     if args.formula_file is not None and args.formula:
         parser.error("--formula and --formula_file are mutually exclusive")
     main(args)

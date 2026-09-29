@@ -44,36 +44,33 @@ def build_callbacks(config: DictConfig) -> list[pl.Callback]:
     ]
     reconstruction = config.train.reconstruction
     if reconstruction.enabled:
-        callbacks.extend(
-            [
-                ValidationReconstruction(
-                    output_dir=directory.parent / "reconstruction",
-                    **{k: v for k, v in reconstruction.items() if k != "enabled"},
-                ),
-                ModelCheckpoint(
-                    dirpath=directory,
-                    filename="best_gwa_epoch_{epoch:04d}",
-                    monitor=f"val/gwa_top{reconstruction.num_samples}",
-                    mode="max",
-                    save_top_k=1,
-                    every_n_epochs=reconstruction.every_n_epochs,
-                    save_on_train_epoch_end=False,
-                    enable_version_counter=False,
-                    auto_insert_metric_name=False,
-                ),
-                ModelCheckpoint(
-                    dirpath=directory,
-                    filename="best_gwa_no_composition_epoch_{epoch:04d}",
-                    monitor=f"val/gwa_top{reconstruction.num_samples}_no_composition",
-                    mode="max",
-                    save_top_k=1,
-                    every_n_epochs=reconstruction.every_n_epochs,
-                    save_on_train_epoch_end=False,
-                    enable_version_counter=False,
-                    auto_insert_metric_name=False,
-                ),
-            ]
+        callbacks.append(
+            ValidationReconstruction(
+                output_dir=directory.parent / "reconstruction",
+                **{k: v for k, v in reconstruction.items() if k != "enabled"},
+            )
         )
+        top_k = reconstruction.num_samples
+        metrics = {
+            "gwa": f"val/gwa_top{top_k}",
+            "gwa_no_composition": f"val/gwa_top{top_k}_no_composition",
+        }
+        if reconstruction.get("predicted_space_groups", 0):
+            metrics["joint_gwa"] = f"val/joint_gwa_top{top_k}"
+        for name, metric in metrics.items():
+            callbacks.append(
+                ModelCheckpoint(
+                    dirpath=directory,
+                    filename=f"best_{name}_epoch_{{epoch:04d}}",
+                    monitor=metric,
+                    mode="max",
+                    save_top_k=1,
+                    every_n_epochs=reconstruction.every_n_epochs,
+                    save_on_train_epoch_end=False,
+                    enable_version_counter=False,
+                    auto_insert_metric_name=False,
+                )
+            )
     return callbacks
 
 

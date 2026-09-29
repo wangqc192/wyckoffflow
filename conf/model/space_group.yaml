@@ -5,5 +5,5 @@ max_num_atoms: 54
 hidden_dim: 256
 composition_encoder_dim: 256
 compatibility: true
-mlp_hidden_layers: 2
+mlp_hidden_layers: 3
 mlp_activation: SiLU

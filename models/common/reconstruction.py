@@ -4,6 +4,7 @@ import csv
 import json
 import logging
 import time
+from collections import Counter
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -15,7 +16,11 @@ from torch_geometric.data import Batch
 
 from models.common.wyckoff_template import WyckoffTemplate
 from models.pl_models.count_conserving import cpu_dp_pool, decode_composition_logits
-from models.sampling import SamplingData, decode_independent_logits
+from models.sampling import (
+    SamplingData,
+    decode_independent_logits,
+    predict_space_group_conditions,
+)
 
 log = logging.getLogger(__name__)
 
@@ -65,11 +70,12 @@ def evaluate_reconstruction(
     flow_steps,
     batch_size,
     cpu_workers,
+    predicted_space_groups=0,
 ):
     """Compare constrained and unconstrained decoding of the same trajectories.
 
-    Each target uses its true composition and space group. Missing decoded
-    samples remain misses in the full validation denominator.
+    Use true space groups by default, or distribute the same total sample budget
+    across the top predicted groups. Missing samples remain misses.
     """
     output_dir = Path(output_dir)
     started = time.monotonic()
@@ -105,7 +111,7 @@ def evaluate_reconstruction(
             writers[mode].writeheader()
         for start in range(0, len(dataset), targets_per_batch):
             stop = min(start + targets_per_batch, len(dataset))
-            trajectories, target_keys = [], {}
+            conditions, target_keys = [], {}
             for index in range(start, stop):
                 graph = dataset[index]
                 templates = WyckoffTemplate.from_protostructure_set(graph.aflow_label)
@@ -130,7 +136,25 @@ def evaluate_reconstruction(
                     target_index=torch.tensor(index),
                     sampling_group=torch.tensor(index),
                 )
-                trajectories.extend(condition.clone() for _ in range(num_samples))
+                conditions.append(condition)
+            if predicted_space_groups:
+                conditions = predict_space_group_conditions(
+                    model,
+                    torch.cat([condition.formula for condition in conditions]),
+                    range(start, stop),
+                    predicted_space_groups,
+                )
+            group_counts = Counter(
+                int(condition.target_index) for condition in conditions
+            )
+            group_ranks = Counter()
+            trajectories = []
+            for condition in conditions:
+                index = int(condition.target_index)
+                repeats, extra = divmod(num_samples, group_counts[index])
+                repeats += group_ranks[index] < extra
+                group_ranks[index] += 1
+                trajectories.extend(condition.clone() for _ in range(repeats))
             data, zero_logits, inf_logits = model.sample_logits(
                 Batch.from_data_list(trajectories), flow_steps=flow_steps
             )
@@ -170,6 +194,7 @@ def evaluate_reconstruction(
         summaries[mode] = {
             "metric": "G-W-A Top-K",
             "top_k": num_samples,
+            "predicted_space_groups": predicted_space_groups,
             "matched_materials": hits,
             "matched_materials_top1": hits_top1,
             "total_materials": len(dataset),
@@ -202,6 +227,7 @@ class ValidationReconstruction(Callback):
         batch_size=128,
         cpu_workers=8,
         seed=42,
+        predicted_space_groups=0,
     ):
         super().__init__()
         if min(every_n_epochs, num_samples, flow_steps, batch_size, cpu_workers) < 1:
@@ -210,6 +236,10 @@ class ValidationReconstruction(Callback):
             )
         if batch_size < num_samples:
             raise ValueError("reconstruction batch_size must be at least num_samples")
+        if not 0 <= predicted_space_groups <= min(num_samples, 230):
+            raise ValueError(
+                "predicted_space_groups must be in 0..min(num_samples, 230)"
+            )
         self.output_dir = Path(output_dir)
         self.every_n_epochs = every_n_epochs
         self.num_samples = num_samples
@@ -217,6 +247,7 @@ class ValidationReconstruction(Callback):
         self.batch_size = batch_size
         self.cpu_workers = cpu_workers
         self.seed = seed
+        self.predicted_space_groups = predicted_space_groups
 
     def on_validation_epoch_end(self, trainer, pl_module):
         if trainer.sanity_checking or trainer.state.fn != TrainerFn.FITTING:
@@ -243,6 +274,17 @@ class ValidationReconstruction(Callback):
                     batch_size=self.batch_size,
                     cpu_workers=self.cpu_workers,
                 )
+                if self.predicted_space_groups:
+                    summary["joint"] = evaluate_reconstruction(
+                        pl_module,
+                        dataset,
+                        directory / "joint",
+                        num_samples=self.num_samples,
+                        flow_steps=self.flow_steps,
+                        batch_size=self.batch_size,
+                        cpu_workers=self.cpu_workers,
+                        predicted_space_groups=self.predicted_space_groups,
+                    )
             metadata = dict(
                 epoch=trainer.current_epoch,
                 completed_epochs=trainer.current_epoch + 1,
@@ -251,6 +293,23 @@ class ValidationReconstruction(Callback):
             )
             summary.update(metadata)
             summary["no_composition"].update(metadata)
+            if self.predicted_space_groups:
+                summary["joint"].update(metadata)
+                summary["joint"]["no_composition"].update(metadata)
+                (directory / "joint/summary.json").write_text(
+                    json.dumps(summary["joint"], indent=2) + "\n", encoding="utf-8"
+                )
+                (directory / "joint/no_composition/summary.json").write_text(
+                    json.dumps(summary["joint"]["no_composition"], indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                log.info(
+                    "Epoch %d joint reconstruction: GWA@1=%.2f%%, GWA@%d=%.2f%%",
+                    trainer.current_epoch + 1,
+                    100 * summary["joint"]["match_rate_top1"],
+                    self.num_samples,
+                    100 * summary["joint"]["match_rate"],
+                )
             (directory / "summary.json").write_text(
                 json.dumps(summary, indent=2) + "\n", encoding="utf-8"
             )
@@ -269,6 +328,14 @@ class ValidationReconstruction(Callback):
                     100 * result["composition_accuracy"],
                 )
         summary = trainer.strategy.broadcast(summary, src=0)
+        if self.predicted_space_groups:
+            for name, value in {
+                "joint_gwa_top1": summary["joint"]["match_rate_top1"],
+                f"joint_gwa_top{self.num_samples}": summary["joint"]["match_rate"],
+            }.items():
+                pl_module.log(
+                    f"val/{name}", value, on_step=False, on_epoch=True, sync_dist=True
+                )
         for suffix, result in (
             ("", summary),
             ("_no_composition", summary["no_composition"]),

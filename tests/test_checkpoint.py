@@ -62,7 +62,7 @@ def test_load_flow_model(tmp_path, stale_run_config):
         "no_multiplicity_encoding": False,
         "binary_dof_encoding": False,
         "no_softmax": False,
-        "mlp_hidden_layers": 1,
+        "mlp_hidden_layers": 2,
         "mlp_activation": "SiLU",
     }
     model = DiscreteFlowModule(
@@ -108,7 +108,7 @@ def test_load_space_group_model(tmp_path):
         "hidden_dim": 8,
         "composition_encoder_dim": 4,
         "compatibility": False,
-        "mlp_hidden_layers": 1,
+        "mlp_hidden_layers": 2,
         "mlp_activation": "SiLU",
     }
     model = SpaceGroupModule(optimizer_config=OPTIMIZER_CONFIG, **config)
@@ -130,7 +130,7 @@ def test_load_model_from_checkpoint_path(tmp_path):
         "hidden_dim": 8,
         "composition_encoder_dim": 4,
         "compatibility": False,
-        "mlp_hidden_layers": 1,
+        "mlp_hidden_layers": 2,
         "mlp_activation": "SiLU",
     }
     model = SpaceGroupModule(optimizer_config=OPTIMIZER_CONFIG, **config)

@@ -79,32 +79,21 @@ class SpaceGroupSetEncoder(nn.Module):
         return self.output_projection(pooled)
 
 
-class SpaceGroupPredictor(nn.Module):
-    def __init__(self, config):
+class SpaceGroupHead(nn.Module):
+    """Score space groups from already encoded composition features."""
+
+    def __init__(self, config, input_dim, *, composition_encoder=None):
         super().__init__()
-        self.num_elements = config["num_elements"]
-        encoder_dim = config.get(
-            "spg_composition_encoder_dim",
-            config.get("composition_encoder_dim"),
-        )
-        self.composition_encoder = (
-            CompositionSetEncoder(
-                self.num_elements,
-                encoder_dim,
-                2 * encoder_dim,
-                config["mlp_hidden_layers"],
-                config["mlp_activation"],
-            )
-            if encoder_dim is not None
-            else None
-        )
-        input_dim = encoder_dim if encoder_dim is not None else self.num_elements + 1
+        # Register the standalone encoder first to preserve optimizer checkpoints.
+        self.composition_encoder = composition_encoder
         self.mlp = get_mlp(
             input_dim,
             231,
             2 * config["hidden_dim"],
             config["mlp_hidden_layers"],
             config["mlp_activation"],
+            layer_norm=config.get("layer_norm", False),
+            dropout=config.get("dropout", 0.0) or None,
         )
 
         use_compatibility = config.get(
@@ -119,6 +108,8 @@ class SpaceGroupPredictor(nn.Module):
                 config["hidden_dim"],
                 config["mlp_hidden_layers"],
                 config["mlp_activation"],
+                layer_norm=config.get("layer_norm", False),
+                dropout=config.get("dropout", 0.0) or None,
             )
             nn.init.zeros_(self.compatibility_mlp[-1].weight)
             nn.init.zeros_(self.compatibility_mlp[-1].bias)
@@ -126,13 +117,7 @@ class SpaceGroupPredictor(nn.Module):
             self.compatibility_encoder = None
             self.compatibility_mlp = None
 
-    def encode(self, composition):
-        if self.composition_encoder is None:
-            return composition.float().log1p()
-        return self.composition_encoder(composition)
-
-    def forward(self, composition):
-        composition_features = self.encode(composition)
+    def forward(self, composition_features):
         logits = self.mlp(composition_features)
         if self.compatibility_mlp is None:
             return logits
@@ -153,3 +138,38 @@ class SpaceGroupPredictor(nn.Module):
             dim=-1,
         )
         return logits + self.compatibility_mlp(interaction).squeeze(-1)
+
+
+class SpaceGroupPredictor(SpaceGroupHead):
+    """Standalone predictor retaining its own composition encoder."""
+
+    def __init__(self, config):
+        num_elements = config["num_elements"]
+        encoder_dim = config.get(
+            "spg_composition_encoder_dim", config.get("composition_encoder_dim")
+        )
+        composition_encoder = (
+            CompositionSetEncoder(
+                num_elements,
+                encoder_dim,
+                2 * encoder_dim,
+                config["mlp_hidden_layers"],
+                config["mlp_activation"],
+            )
+            if encoder_dim is not None
+            else None
+        )
+        super().__init__(
+            config,
+            encoder_dim if encoder_dim is not None else num_elements + 1,
+            composition_encoder=composition_encoder,
+        )
+        self.num_elements = num_elements
+
+    def encode(self, composition):
+        if self.composition_encoder is None:
+            return composition.float().log1p()
+        return self.composition_encoder(composition)
+
+    def forward(self, composition):
+        return super().forward(self.encode(composition))
