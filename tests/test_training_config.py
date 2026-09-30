@@ -34,6 +34,7 @@ def test_default_training_config_uses_local_flow_model():
     )
     assert config.optim._target_ == "torch.optim.AdamW"
     assert config.model.decoder._target_ == "models.pl_models.gnn.WyckoffGNN"
+    assert config.model.label_smoothing == 0.05
     assert "model_config" not in config.model
     assert "flow_steps" not in config.model
     assert "hidden_dim" not in config.model
@@ -61,6 +62,7 @@ def test_decoder_overrides_support_forward_and_backward():
     assert model.max_num_atoms == 8
     assert model.zero_df_loss_weight == 2.0
     assert model.inf_df_loss_weight == 3.0
+    assert model.label_smoothing == 0.05
     assert "model_config" not in model.hparams
     assert "flow_steps" not in model.hparams
     assert isinstance(model.configure_optimizers(), torch.optim.AdamW)

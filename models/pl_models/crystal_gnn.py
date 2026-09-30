@@ -187,6 +187,7 @@ class CrystalGNN(nn.Module):
         conditional_composition=True,
         continuous_time=True,
         external_composition=False,
+        predict_all_elements=False,
     ):
         super().__init__()
         if not conditional_composition or not continuous_time:
@@ -200,6 +201,7 @@ class CrystalGNN(nn.Module):
         self.hidden_dim = hidden_dim
         self.element_dim = element_dim
         self.external_composition = external_composition
+        self.predict_all_elements = predict_all_elements
         self.use_composition_residual = use_composition_residual
         self.element_embedding = (
             None
@@ -370,9 +372,17 @@ class CrystalGNN(nn.Module):
             hidden = layer(hidden, condition, data.edge_index, edge_features)
         hidden = self.output_norm(hidden)
 
-        # Compute shared heads only for elements actually in each composition.
-        # Other channels are placeholders masked by DiscreteFlowModule.
-        nodes, elements = (target[data.batch] > 0).nonzero(as_tuple=True)
+        # Unmasked training needs learned predictions for absent elements too.
+        # Otherwise their channels remain placeholders for the caller to mask.
+        if self.predict_all_elements:
+            nodes = torch.arange(
+                hidden.shape[0], device=hidden.device
+            ).repeat_interleave(self.num_elements)
+            elements = torch.arange(self.num_elements, device=hidden.device).repeat(
+                hidden.shape[0]
+            )
+        else:
+            nodes, elements = (target[data.batch] > 0).nonzero(as_tuple=True)
         graphs = data.batch[nodes]
         multiplicity = data.multiplicities[nodes].float()
         atom_target = target[graphs, elements]
@@ -383,7 +393,7 @@ class CrystalGNN(nn.Module):
         pair_features = torch.stack(
             (
                 current.log1p(),
-                current * multiplicity / atom_target,
+                current * multiplicity / atom_target.clamp_min(1),
                 (atom_target / multiplicity).log1p(),
                 torch.remainder(atom_target, multiplicity) / multiplicity,
                 _signed_log1p(residual / multiplicity),

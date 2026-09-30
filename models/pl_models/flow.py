@@ -40,8 +40,10 @@ class DiscreteFlowModule(OptimizedLightningModule):
         flow_source,
         zero_df_loss_weight=1.0,
         inf_df_loss_weight=1.0,
+        mask_loss_by_composition=True,
         conditional_composition=True,
         validation_seed=42,
+        label_smoothing=0.0,
     ):
         super().__init__(optimizer_config, "discrete_flow")
         decoder = resolve_config(decoder)
@@ -52,8 +54,12 @@ class DiscreteFlowModule(OptimizedLightningModule):
         self.max_num_atoms = max_num_atoms
         self.zero_df_loss_weight = float(zero_df_loss_weight)
         self.inf_df_loss_weight = float(inf_df_loss_weight)
+        self.mask_loss_by_composition = mask_loss_by_composition
+        self.label_smoothing = float(label_smoothing)
         if self.zero_df_loss_weight < 0 or self.inf_df_loss_weight < 0:
             raise ValueError("loss weights must be non-negative")
+        if not 0 <= self.label_smoothing <= 1:
+            raise ValueError("label_smoothing must be between 0 and 1")
         if not conditional_composition:
             raise ValueError("DiscreteFlowModule requires conditional_composition=True")
 
@@ -76,6 +82,10 @@ class DiscreteFlowModule(OptimizedLightningModule):
             continuous_time=True,
             _recursive_=False,
         )
+        if not mask_loss_by_composition and not getattr(
+            self.decoder, "predict_all_elements", True
+        ):
+            raise ValueError("Unmasked loss requires decoder.predict_all_elements=True")
 
     def forward(self, batch):
         return self.flow_loss(batch, self.encode_composition(batch.composition))
@@ -118,17 +128,29 @@ class DiscreteFlowModule(OptimizedLightningModule):
         )
 
         zero_logits, inf_logits = self.decode(data_t, time, composition_features)
-        zero_logits, inf_logits, allowed = self._mask_logits(
-            zero_logits,
-            inf_logits,
-            data_t,
-        )
+        raw_inf_logits = inf_logits
+        if self.mask_loss_by_composition:
+            zero_logits, inf_logits, allowed = self._mask_logits(
+                zero_logits,
+                inf_logits,
+                data_t,
+            )
+        else:
+            # Absent elements are supervised as count zero, not excluded.
+            allowed = torch.ones(
+                (batch_size, self.num_elements), dtype=torch.bool, device=self.device
+            )
         variables_per_graph = batch.num_0_dof + batch.num_inf_dof * allowed.sum(dim=1)
 
-        zero_loss = F.cross_entropy(
+        zero_allowed = torch.ones_like(zero_logits, dtype=torch.bool)
+        if self.mask_loss_by_composition:
+            zero_allowed = data_t.composition[data_t.batch[data_t.zero_dof]] > 0
+            zero_allowed[:, 0] = True
+        zero_loss = self._cross_entropy(
             zero_logits,
             batch.x_0_dof.long(),
             reduction="none",
+            allowed=zero_allowed,
         )
         zero_loss = scatter(
             zero_loss,
@@ -140,9 +162,10 @@ class DiscreteFlowModule(OptimizedLightningModule):
         zero_loss = (zero_loss / variables_per_graph).mean()
 
         inf_loss = F.cross_entropy(
-            inf_logits.flatten(0, 1),
+            raw_inf_logits.flatten(0, 1),
             batch.x_inf_dof.flatten().long(),
             reduction="none",
+            label_smoothing=self.label_smoothing,
         ).reshape(-1, self.num_elements)
         inf_graph = data_t.batch[~data_t.zero_dof]
         inf_loss = (inf_loss * allowed[inf_graph]).sum(dim=1)
@@ -163,6 +186,23 @@ class DiscreteFlowModule(OptimizedLightningModule):
             "zero_df_loss": zero_loss,
             "inf_df_loss": inf_loss,
         }
+
+    def _cross_entropy(self, logits, targets, *, reduction, allowed):
+        if self.label_smoothing == 0 or allowed.all():
+            return F.cross_entropy(
+                logits,
+                targets,
+                reduction=reduction,
+                label_smoothing=self.label_smoothing,
+            )
+        masked_logits = logits.masked_fill(
+            ~allowed,
+            torch.finfo(logits.dtype).min,
+        )
+        log_probs = masked_logits.log_softmax(dim=-1)
+        nll = -log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+        smooth = -(log_probs * allowed).sum(dim=-1) / allowed.sum(dim=-1)
+        return (1 - self.label_smoothing) * nll + self.label_smoothing * smooth
 
     @staticmethod
     def _apply_element_mask(zero_logits, inf_logits, zero_allowed, inf_allowed):

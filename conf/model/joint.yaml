@@ -16,6 +16,7 @@ decay_matrix_weights_only: false
 flow_encoder_grad_scale: 1.0
 zero_df_loss_weight: 1.0
 inf_df_loss_weight: 1.0
+label_smoothing: 0.05
 
 sg_head:
   hidden_dim: ${model.decoder.hidden_dim}

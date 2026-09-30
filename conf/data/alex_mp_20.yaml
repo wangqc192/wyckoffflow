@@ -1,0 +1,38 @@
+defaults:
+  - default
+  - _self_
+
+root_path: /home/wangqc/mattergen/datasets/alex_mp_20
+cache_path: ${hydra:runtime.cwd}/data/alex_mp_20
+dataset_name: alex_mp_20
+
+preprocess:
+  num_workers: 8
+  chunk_size: 1000
+  symprec: 0.1
+  fallback_symprec: 1.0e-5
+
+datamodule:
+  datasets:
+    train:
+      preprocess_options:
+        processed_file_path: ${data.cache_path}/train.pt
+        num_workers: ${data.preprocess.num_workers}
+        chunk_size: ${data.preprocess.chunk_size}
+        symprec: ${data.preprocess.symprec}
+        fallback_symprec: ${data.preprocess.fallback_symprec}
+    val:
+      - _target_: models.pl_data.dataset.CrystalDataset
+        data: ${data.root_path}/val.csv
+        num_elements: ${data.num_elements}
+        preprocess_options:
+          processed_file_path: ${data.cache_path}/val.pt
+          num_workers: ${data.preprocess.num_workers}
+          chunk_size: ${data.preprocess.chunk_size}
+          symprec: ${data.preprocess.symprec}
+          fallback_symprec: ${data.preprocess.fallback_symprec}
+    test: []
+  batch_size:
+    train: 256
+    val: 256
+    test: 256

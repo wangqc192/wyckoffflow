@@ -30,6 +30,7 @@ class JointSpaceGroupWyckoffModule(DiscreteFlowModule):
         validation_seed=42,
         decay_matrix_weights_only=False,
         flow_encoder_grad_scale=1.0,
+        label_smoothing=0.0,
     ):
         decoder = {**resolve_config(decoder), "external_composition": True}
         super().__init__(
@@ -42,6 +43,7 @@ class JointSpaceGroupWyckoffModule(DiscreteFlowModule):
             inf_df_loss_weight=inf_df_loss_weight,
             conditional_composition=conditional_composition,
             validation_seed=validation_seed,
+            label_smoothing=label_smoothing,
         )
         sg_head = resolve_config(sg_head)
         self.task = "joint"

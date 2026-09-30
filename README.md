@@ -5,6 +5,26 @@
 本文档中的文件命名约定：CrystalFlow 使用 `diffcsp`；DiffCSP++ 使用 `diffcsppp`。
 命令中的 `<model_path>`、`<dataset>`、`<input_csv>` 等表示需要替换为实际路径或名称的参数。
 
+## 使用 MatterGen alex_mp_20 训练
+
+```bash
+uv run python -m models.run data=alex_mp_20
+```
+
+配置默认读取 `/home/wangqc/mattergen/datasets/alex_mp_20/train.csv` 和
+`val.csv`（分别为 607,683 和 67,521 条），沿用原始划分，不设置测试集。
+首次运行自动用 8 个 CPU 进程分块预处理 CIF，缓存写入本仓库的
+`data/alex_mp_20/train.pt` 和 `val.pt`，后续训练直接复用。多 GPU 训练时，
+Lightning 在数据加载前由一个 rank 准备缓存。可通过 `data.root_path`、
+`data.cache_path`、`data.preprocess.num_workers` 修改路径和预处理进程数。
+
+已有 `wyckoff_spglib` 时直接使用；否则从 CIF 通过 spglib 提取模板，
+沿用 MP20 的 `symprec=0.1`、角度容差 5 和失败时的 `fallback_symprec=1e-5`，
+保留等价原点/设置下的 Wyckoff 模板。空间群编号从模板读取，不使用 CSV 中的
+空间群字符串。源文件或对称性容差改变后会重新生成缓存。
+该数据没有 `formation_energy_per_atom`，相应图属性为 NaN；现有模板/空间群
+训练不使用该属性，也不会将 `energy_above_hull` 当成形成能。
+
 ## 实验目录命名
 
 训练目录自动包含实验类型、实验标签、数据配置、网络结构和关键训练参数，例如：
@@ -110,7 +130,8 @@ uv run python scripts/plot_loss.py outputs
 `conf/model/decoder/`，默认是 `wyckoff_gnn.yaml`。网络层数、隐藏维度、
 组成编码、FiLM 和 MLP 等参数放在 `model.decoder` 中；source、损失权重等
 直接放在 `model` 中，例如
-`model.zero_df_loss_weight=2.0` 和 `model.inf_df_loss_weight=1.0`。
+`model.zero_df_loss_weight=2.0`、`model.inf_df_loss_weight=1.0` 和
+`model.label_smoothing=0.05`。当前默认配置使用 0.05 的标签平滑。
 
 ~~~bash
 uv run python -m models.run \

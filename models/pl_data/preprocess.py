@@ -1,22 +1,24 @@
-"""Preprocessing helpers for Wyckoff/AFLOW crystal data.
-
-The MP20 files store a protostructure in the ``wyckoff_spglib`` column.  The
-model consumes a normalized representation instead: one row per material with
-the parsed space group, elements, equivalent Wyckoff sets, and an encoded
-element matrix.  This module keeps that conversion independent from the
-PyTorch Geometric dataset wrapper in :mod:`dataset`.
-"""
+"""Convert MP20 labels or MatterGen CIFs to equivalent Wyckoff templates."""
 
 from __future__ import annotations
 
+import json
+import logging
+import multiprocessing
 import os
+import tempfile
+import warnings
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 import aviary.wren.data as aviary_wren_data
+import numpy as np
 import pandas as pd
 import torch
+from aviary.wren.utils import get_protostructure_label_from_spglib
+from pymatgen.core import Structure
 
 from ..common.lookup_tables import (
     chemical_symbols,
@@ -26,23 +28,55 @@ from ..common.lookup_tables import (
     wyckoff_label_to_index,
 )
 
+log = logging.getLogger(__name__)
+
 
 def _space_group_table(table: dict, space_group: str) -> Any:
     return table[str(space_group)]
 
 
-def extract_wyckoff_data_and_properties(data_frame_row: pd.Series) -> pd.Series:
-    """Parse one MP20 row into the fields used by the graph representation."""
+def extract_wyckoff_data_and_properties(
+    data_frame_row: pd.Series,
+    *,
+    symprec: float = 0.1,
+    fallback_symprec: float | None = 1e-5,
+) -> pd.Series:
+    """Parse an existing label, or derive it from the CIF when absent."""
 
-    label_column = "wyckoff_spglib"
-    spg, _, elements, wyckoff_set = aviary_wren_data.parse_protostructure_label(
-        data_frame_row[label_column]
-    )
-    e_form_per_atom = data_frame_row["formation_energy_per_atom"]
+    label = data_frame_row.get("wyckoff_spglib")
+    if pd.isna(label):
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="dict interface is deprecated.*",
+                    category=DeprecationWarning,
+                )
+                warnings.filterwarnings(
+                    "ignore",
+                    message="Issues encountered while parsing CIF:.*fractional coordinates rounded.*",
+                )
+                structure = Structure.from_str(data_frame_row["cif"], fmt="cif")
+                label = get_protostructure_label_from_spglib(
+                    structure,
+                    raise_errors=True,
+                    init_symprec=symprec,
+                    fallback_symprec=fallback_symprec,
+                )
+        except ValueError as exc:
+            identifier = data_frame_row.get("material_id", data_frame_row.name)
+            raise ValueError(
+                f"Could not extract Wyckoff template for {identifier}: {exc}"
+            ) from exc
+    spg, _, elements, wyckoff_set = aviary_wren_data.parse_protostructure_label(label)
+    # Aviary returns equivalent settings from a set; keep cache ordering stable
+    # across worker processes without changing the element/site correspondence.
+    wyckoff_set = sorted(wyckoff_set)
+    e_form_per_atom = data_frame_row.get("formation_energy_per_atom", float("nan"))
 
     return pd.Series(
         {
-            "aflow_label": data_frame_row[label_column],
+            "aflow_label": label,
             "space_group": str(spg),
             "elements": elements,
             "wyckoff_set": wyckoff_set,
@@ -52,7 +86,7 @@ def extract_wyckoff_data_and_properties(data_frame_row: pd.Series) -> pd.Series:
 
 
 def map_element_to_index(element: str | int) -> int:
-    """"element symbols to number"""
+    """Map an element symbol to its atomic number."""
 
     return chemical_symbols.index(str(element))
 
@@ -201,24 +235,40 @@ def fetch_wyckoff_multiplicities(space_group: str | int) -> list[int]:
     return values
 
 
-def preprocess_dataframe(wd_df: pd.DataFrame) -> pd.DataFrame:
-    """Convert an in-memory raw MP20 table to model-ready columns."""
+def preprocess_dataframe(
+    wd_df: pd.DataFrame,
+    *,
+    symprec: float = 0.1,
+    fallback_symprec: float | None = 1e-5,
+) -> pd.DataFrame:
+    """Convert raw labels/CIFs; absent formation energies remain NaN.
 
-    required = {"wyckoff_spglib", "formation_energy_per_atom"}
-    missing = required.difference(wd_df.columns)
-    if missing:
-        raise ValueError(f"Raw MP20 file is missing columns: {sorted(missing)}")
+    The CSV's ``space_group`` field may be a symbol or a placeholder. The
+    model's numeric space group always comes from the extracted template.
+    """
+
+    if not {"wyckoff_spglib", "cif"}.intersection(wd_df.columns):
+        raise ValueError("Raw crystal data requires 'wyckoff_spglib' or 'cif'")
     if wd_df.empty:
         return pd.DataFrame(columns=_PROCESSED_COLUMNS)
 
-    parsed = wd_df.apply(extract_wyckoff_data_and_properties, axis=1)
+    parsed = wd_df.apply(
+        extract_wyckoff_data_and_properties,
+        axis=1,
+        symprec=symprec,
+        fallback_symprec=fallback_symprec,
+    )
     parsed["wyckoff_element_matrix"] = parsed.apply(
-        lambda row: format_wyckoff_element_matrix(row), axis=1
+        # Dense Python integer lists dominate memory for the 675k-row dataset.
+        lambda row: np.asarray(format_wyckoff_element_matrix(row), dtype=np.int32),
+        axis=1,
     )
     parsed["degrees_of_freedom"] = parsed["space_group"].map(
         fetch_wyckoff_degrees_of_freedom
     )
     parsed["multiplicities"] = parsed["space_group"].map(fetch_wyckoff_multiplicities)
+    if "material_id" in wd_df:
+        parsed["material_id"] = wd_df["material_id"]
     return parsed.reset_index(drop=True)
 
 
@@ -236,7 +286,11 @@ def save_preprocessed(
 
     output_path = Path(processed_file_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(data_frame, output_path)
+    with tempfile.NamedTemporaryFile(
+        dir=output_path.parent, suffix=".pt.tmp", delete=False
+    ) as handle:
+        torch.save(data_frame, handle)
+    os.replace(handle.name, output_path)
     return output_path
 
 
@@ -246,16 +300,22 @@ def load_preprocessed(processed_file_path: str | os.PathLike[str]) -> pd.DataFra
     return torch.load(Path(processed_file_path), map_location="cpu", weights_only=False)
 
 
-def preprocess(
+def prepare_preprocessed(
     raw_file_path: str | os.PathLike[str],
     processed_file_path: str | os.PathLike[str] | None = None,
     force: bool = False,
-) -> pd.DataFrame:
-    """Read an MP20 CSV, cache its model-ready rows, and return a DataFrame.
+    *,
+    num_workers: int = 0,
+    chunk_size: int = 1000,
+    symprec: float = 0.1,
+    fallback_symprec: float | None = 1e-5,
+) -> Path:
+    """Prepare a cache without loading it, suitable for Lightning prepare_data.
 
     By default the cache is written next to the CSV with the same stem and a
-    ``.pt`` suffix.  A cache newer than the raw CSV is reused; pass ``force``
-    to rebuild it.
+    ``.pt`` suffix. Raw data is read in chunks and optionally processed in
+    parallel. Row order and all equivalent templates are preserved; malformed
+    structures raise errors instead of silently dropping training samples.
     """
 
     path = Path(raw_file_path)
@@ -267,16 +327,69 @@ def preprocess(
         if processed_file_path is None
         else Path(processed_file_path)
     )
+    stat = path.stat()
+    metadata = {
+        "version": 1,
+        "source": str(path.resolve()),
+        "mtime_ns": stat.st_mtime_ns,
+        "size": stat.st_size,
+        "symprec": symprec,
+        "fallback_symprec": fallback_symprec,
+    }
+    metadata_path = cache_path.with_suffix(cache_path.suffix + ".json")
     if (
         not force
         and cache_path.exists()
-        and cache_path.stat().st_mtime >= path.stat().st_mtime
+        and cache_path.stat().st_mtime >= stat.st_mtime
     ):
-        return load_preprocessed(cache_path)
+        if metadata_path.exists():
+            if json.loads(metadata_path.read_text()) == metadata:
+                return cache_path
+        elif (
+            cache_path == processed_path(path)
+            and symprec == 0.1
+            and fallback_symprec == 1e-5
+        ):
+            # Preserve existing MP20 caches written before metadata was added.
+            return cache_path
 
-    parsed = preprocess_dataframe(pd.read_csv(path))
+    process_chunk = partial(
+        preprocess_dataframe, symprec=symprec, fallback_symprec=fallback_symprec
+    )
+    frames = []
+    row_count = 0
+
+    def collect(chunks):
+        nonlocal row_count
+        for frame in chunks:
+            frames.append(frame)
+            row_count += len(frame)
+            log.info("Preprocessed %s: %d rows", path.name, row_count)
+
+    with pd.read_csv(path, chunksize=chunk_size) as reader:
+        if num_workers > 1:
+            with multiprocessing.get_context("spawn").Pool(num_workers) as pool:
+                collect(pool.imap(process_chunk, reader))
+        else:
+            collect(map(process_chunk, reader))
+
+    parsed = pd.concat(frames, ignore_index=True)
     save_preprocessed(parsed, cache_path)
-    return parsed
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
+    return cache_path
+
+
+def preprocess(
+    raw_file_path: str | os.PathLike[str],
+    processed_file_path: str | os.PathLike[str] | None = None,
+    force: bool = False,
+    **options: Any,
+) -> pd.DataFrame:
+    """Read a label/CIF CSV, preparing or reusing its model-ready cache."""
+
+    return load_preprocessed(
+        prepare_preprocessed(raw_file_path, processed_file_path, force, **options)
+    )
 
 
 __all__ = [
@@ -292,6 +405,7 @@ __all__ = [
     "load_preprocessed",
     "preprocess",
     "preprocess_dataframe",
+    "prepare_preprocessed",
     "processed_path",
     "save_preprocessed",
 ]

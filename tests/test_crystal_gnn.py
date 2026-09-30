@@ -2,6 +2,7 @@ import hydra
 import pytest
 import pytorch_lightning as pl
 import torch
+import torch.nn.functional as F
 from hydra import compose, initialize_config_dir
 from torch_geometric.data import Batch
 
@@ -129,7 +130,7 @@ def test_time_endpoints_and_composition_amount_affect_predictions():
     assert not torch.allclose(at_zero[:, 7], doubled[:, 7])
 
 
-def make_flow():
+def make_flow(*overrides):
     with initialize_config_dir(
         config_dir=str(PROJECT_ROOT / "conf"), version_base="1.3"
     ):
@@ -144,6 +145,7 @@ def make_flow():
                 "model.decoder.num_heads=4",
                 "model.decoder.num_gnn_layers=2",
                 "model.decoder.dropout=0.0",
+                *overrides,
             ],
         )
     return hydra.utils.instantiate(
@@ -173,8 +175,12 @@ def test_flow_loss_backward_with_positive_counts_and_mixed_precision():
 
 
 @pytest.mark.parametrize("greedy", [False, True])
-def test_flow_sampling_and_exact_composition_decoding(greedy):
-    model = make_flow().eval()
+@pytest.mark.parametrize("unmasked", [False, True])
+def test_flow_sampling_and_exact_composition_decoding(greedy, unmasked):
+    model = make_flow(
+        f"model.mask_loss_by_composition={not unmasked}",
+        f"model.decoder.predict_all_elements={unmasked}",
+    ).eval()
     composition = formula_to_counts("Li2O4", 10)
     conditions = Batch.from_data_list(
         [
@@ -183,6 +189,10 @@ def test_flow_sampling_and_exact_composition_decoding(greedy):
         ]
     )
     data, zero, variable = model.sample_logits(conditions, flow_steps=3, greedy=greedy)
+    absent = composition == 0
+    absent[0] = False
+    assert torch.isneginf(zero[:, absent]).all()
+    assert torch.isneginf(variable[:, absent[1:], 1:]).all()
     decoded = decode_composition_logits(
         data, zero, variable, 8, stochastic=False, cpu_workers=1
     )
@@ -192,19 +202,32 @@ def test_flow_sampling_and_exact_composition_decoding(greedy):
         torch.testing.assert_close(allocated[0], composition[1:])
 
 
-def test_new_decoder_checkpoint_restores_outputs(tmp_path):
-    model = make_flow().eval()
+@pytest.mark.parametrize(
+    "unmasked,legacy", [(False, False), (False, True), (True, False)]
+)
+def test_new_decoder_checkpoint_restores_outputs(tmp_path, unmasked, legacy):
+    model = make_flow(
+        f"model.mask_loss_by_composition={not unmasked}",
+        f"model.decoder.predict_all_elements={unmasked}",
+    ).eval()
     batch = Batch.from_data_list([make_graph(194, occupied=True)])
     path = tmp_path / "crystal.ckpt"
+    hyperparameters = dict(model.hparams)
+    if legacy:
+        hyperparameters.pop("mask_loss_by_composition")
+        hyperparameters["decoder"] = dict(hyperparameters["decoder"])
+        hyperparameters["decoder"].pop("predict_all_elements")
     torch.save(
         {
             "pytorch-lightning_version": pl.__version__,
-            "hyper_parameters": dict(model.hparams),
+            "hyper_parameters": hyperparameters,
             "state_dict": model.state_dict(),
         },
         path,
     )
     loaded = DiscreteFlowModule.load_from_checkpoint(path, weights_only=False).eval()
+    assert loaded.mask_loss_by_composition == (not unmasked)
+    assert loaded.decoder.predict_all_elements == unmasked
     with torch.no_grad():
         before = model.decoder(batch, torch.tensor([0.4]))
         after = loaded.decoder(batch, torch.tensor([0.4]))
@@ -224,3 +247,82 @@ def test_ablation_options_support_backward():
     assert all(
         torch.isfinite(p.grad).all() for p in decoder.parameters() if p.grad is not None
     )
+
+
+def test_all_element_heads_preserve_present_predictions():
+    batch = Batch.from_data_list([make_graph(1), make_graph(2, occupied=True)])
+    restricted = make_decoder().eval()
+    full = make_decoder(predict_all_elements=True).eval()
+    time = torch.tensor([0.2, 0.7])
+    with torch.no_grad():
+        zero, inf = restricted(batch, time)
+        full_zero, full_inf = full(batch, time)
+    torch.testing.assert_close(full_zero[:, [0, 3, 8]], zero[:, [0, 3, 8]])
+    torch.testing.assert_close(full_inf[:, [2, 7]], inf[:, [2, 7]])
+
+
+def test_absent_element_predictions_have_finite_nonzero_gradients():
+    graph = make_graph(2, occupied=True)
+    # Include a noisy occupation of H, absent from the target Li/O composition.
+    graph.x_inf_dof[0, 0] = 1
+    decoder = make_decoder(predict_all_elements=True)
+    batch = Batch.from_data_list([graph])
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        zero, inf = decoder(batch, torch.tensor([0.5]))
+        loss = F.cross_entropy(
+            zero[:, [0, 1]], torch.zeros(zero.shape[0], dtype=torch.long)
+        ) + F.cross_entropy(inf[:, 0], torch.zeros(inf.shape[0], dtype=torch.long))
+    loss.backward()
+    assert torch.isfinite(loss)
+    for module in (decoder.element_head, decoder.count_head, decoder.pair_encoder):
+        gradients = [parameter.grad for parameter in module.parameters()]
+        assert all(g is not None and torch.isfinite(g).all() for g in gradients)
+        assert any(g.count_nonzero() for g in gradients)
+    assert decoder.element_embedding.weight.grad[1].count_nonzero() > 0
+    assert all(
+        torch.isfinite(p.grad).all() for p in decoder.parameters() if p.grad is not None
+    )
+
+
+def test_unmasked_loss_counts_all_elements_and_averages_per_crystal(monkeypatch):
+    model = make_flow(
+        "model.mask_loss_by_composition=false",
+        "model.decoder.predict_all_elements=true",
+    )
+    graphs = [make_graph(1, occupied=True), make_graph(2, occupied=True)]
+    batch = Batch.from_data_list(graphs)
+    zero = torch.randn(batch.x_0_dof.numel(), 11, requires_grad=True)
+    inf = torch.randn(*batch.x_inf_dof.shape, 9, requires_grad=True)
+    monkeypatch.setattr(model, "decode", lambda *_args: (zero, inf))
+    loss = model(batch)["loss"]
+    per_graph = []
+    nz_offset = ni_offset = 0
+    for graph in graphs:
+        nz, ni = int(graph.num_0_dof), int(graph.num_inf_dof)
+        total = F.cross_entropy(
+            zero[nz_offset : nz_offset + nz],
+            graph.x_0_dof,
+            reduction="sum",
+            label_smoothing=model.label_smoothing,
+        ) + F.cross_entropy(
+            inf[ni_offset : ni_offset + ni].reshape(-1, 9),
+            graph.x_inf_dof.flatten(),
+            reduction="sum",
+            label_smoothing=model.label_smoothing,
+        )
+        per_graph.append(total / (nz + ni * 10))
+        nz_offset += nz
+        ni_offset += ni
+    torch.testing.assert_close(loss, torch.stack(per_graph).mean())
+    loss.backward()
+    # H is absent: its count-zero targets must now contribute to training.
+    assert (inf.grad[:, 0, 0] < 0).all()
+    assert torch.isfinite(inf.grad[:, 0, 1:]).all()
+    assert inf.grad[:, 0, 1:].abs().sum() > 0
+
+
+def test_unmasked_loss_rejects_placeholder_element_outputs():
+    with pytest.raises(
+        hydra.errors.InstantiationException, match="predict_all_elements"
+    ):
+        make_flow("model.mask_loss_by_composition=false")

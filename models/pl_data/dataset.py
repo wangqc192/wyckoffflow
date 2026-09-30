@@ -31,27 +31,34 @@ def _tensor(value: Any, dtype: torch.dtype | None = None) -> torch.Tensor:
 class CrystalDataset(Dataset):
     """Expose preprocessed crystal dictionaries as PyG ``Data`` objects.
 
-    ``data`` can be the list returned by :func:`preprocess`, a pandas frame, a
+    ``data`` can be a pandas frame, a list of records, a
     single record, or a path to a CSV/``.pt``/pickle cache.  The constructor
     keeps the original skeleton's intentionally small interface while accepting
-    these convenient input forms.
+    these convenient input forms. ``preprocess_options`` forwards CSV cache,
+    worker and symmetry settings to :func:`preprocess`.
     """
 
-    def __init__(self, data: Any, num_elements: int = 118, transform: Any = None):
+    def __init__(
+        self,
+        data: Any,
+        num_elements: int = 118,
+        transform: Any = None,
+        preprocess_options: Mapping[str, Any] | None = None,
+    ):
         super().__init__()
         if not isinstance(num_elements, int) or num_elements < 1:
             raise ValueError("num_elements must be a positive integer")
         self.num_elements = num_elements
         self.transform = transform
-        self.data = self._load(data)
+        self.data = self._load(data, **dict(preprocess_options or {}))
         self._prototype_keys: tuple[str, ...] | None = None
 
     @staticmethod
-    def _load(data: Any) -> list[Any]:
+    def _load(data: Any, **preprocess_options: Any) -> list[Any]:
         if isinstance(data, (str, os.PathLike)):
             path = Path(data)
             if path.suffix.lower() == ".csv":
-                data = preprocess(path)
+                data = preprocess(path, **preprocess_options)
             elif path.suffix.lower() in {".pt", ".pth"}:
                 data = torch.load(path, map_location="cpu", weights_only=False)
             elif path.suffix.lower() in {".pkl", ".pickle"}:
@@ -62,10 +69,23 @@ class CrystalDataset(Dataset):
                     "data path must end in .csv, .pt, .pth, .pkl or .pickle"
                 )
 
+        symmetry_options = {
+            name: preprocess_options[name]
+            for name in ("symprec", "fallback_symprec")
+            if name in preprocess_options
+        }
+        if isinstance(data, pd.Series) or (
+            isinstance(data, Mapping)
+            and {
+                "wyckoff_spglib",
+                "cif",
+            }.intersection(data)
+        ):
+            data = pd.DataFrame([data])
         if isinstance(data, pd.DataFrame):
-            if {"wyckoff_spglib", "formation_energy_per_atom"}.issubset(data.columns):
-                data = preprocess_dataframe(data)
-            return [row for _, row in data.iterrows()]
+            if {"wyckoff_spglib", "cif"}.intersection(data.columns):
+                data = preprocess_dataframe(data, **symmetry_options)
+            return data.to_dict("records")
         if isinstance(data, (pd.Series, Mapping, Data)):
             return [data]
         try:
@@ -75,14 +95,11 @@ class CrystalDataset(Dataset):
         if (
             records
             and isinstance(records[0], Mapping)
-            and {
-                "wyckoff_spglib",
-                "formation_energy_per_atom",
-            }.issubset(records[0])
+            and {"wyckoff_spglib", "cif"}.intersection(records[0])
         ):
-            records = [
-                row for _, row in preprocess_dataframe(pd.DataFrame(records)).iterrows()
-            ]
+            records = preprocess_dataframe(
+                pd.DataFrame(records), **symmetry_options
+            ).to_dict("records")
         return records
 
     def __len__(self) -> int:
@@ -208,7 +225,7 @@ class CrystalDataset(Dataset):
             composition=composition,
         )
         # These fields are useful for traceability but are not model inputs.
-        for name in ("aflow_label", "elements", "wyckoff_set"):
+        for name in ("aflow_label", "elements", "wyckoff_set", "material_id"):
             if name in record and record[name] is not None:
                 setattr(graph, name, record[name])
         return graph

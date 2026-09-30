@@ -5,6 +5,7 @@ from __future__ import annotations
 import random
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 import hydra
@@ -16,6 +17,7 @@ from torch.utils.data import Dataset, WeightedRandomSampler
 from torch_geometric.loader import DataLoader
 
 from models.common.utils import PROJECT_ROOT
+from models.pl_data.preprocess import prepare_preprocessed
 
 
 def worker_init_fn(_worker_id: int) -> None:
@@ -30,8 +32,8 @@ def worker_init_fn(_worker_id: int) -> None:
 class CrystDataModule(pl.LightningDataModule):
     """Create train, validation, and test loaders in the PODGen style.
 
-    ``datasets`` should contain ``train``, ``val`` and ``test`` entries.  The
-    latter two may each be one dataset configuration or a list of configurations.
+    ``datasets`` contains ``train`` plus lists of ``val`` and ``test`` entries.
+    Use an empty ``test`` list for datasets without a test split.
     ``num_workers`` and ``batch_size`` are mappings with ``train``, ``val`` and
     ``test`` keys, matching the reference configuration layout.
     """
@@ -56,6 +58,14 @@ class CrystDataModule(pl.LightningDataModule):
         self.train_dataset: Dataset | None = None
         self.val_datasets: list[Dataset] | None = None
         self.test_datasets: list[Dataset] | None = None
+
+    def prepare_data(self) -> None:
+        # Lightning runs this on one rank before the distributed setup barrier.
+        configs = [self.datasets.train, *self.datasets.val, *self.datasets.test]
+        for config in configs:
+            data = config.get("data")
+            if isinstance(data, str) and Path(data).suffix.lower() == ".csv":
+                prepare_preprocessed(data, **config.get("preprocess_options", {}))
 
     def setup(self, stage: str | None = None) -> None:
         if stage in (None, "fit"):
