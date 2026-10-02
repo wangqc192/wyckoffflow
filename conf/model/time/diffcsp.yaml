@@ -1,0 +1,7 @@
+# @package model.decoder.time
+
+_target_: models.pl_models.time_embedding.DiffCSPTimeEncoder
+# 33 sin/cos pairs match Fourier's 32 pairs plus t and 1-t.
+num_frequencies: 33
+max_period: 10000.0
+time_scale: 1.0

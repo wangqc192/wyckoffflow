@@ -5,8 +5,8 @@ import torch
 import torch.nn.functional as F
 
 from .base import resolve_config
+from .composition_encoder import CompositionFeatures, CrystalCompositionEncoder
 from .count_conserving import formula_space_group_mask
-from .crystal_gnn import CompositionFeatures, CrystalCompositionEncoder
 from .flow import DiscreteFlowModule
 from .spg_predictor import SpaceGroupHead
 

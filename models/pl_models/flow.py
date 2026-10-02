@@ -30,6 +30,21 @@ def categorical_flow_step(current, target_logits, jump_probability, *, greedy=Fa
     return torch.where(jump, target, current)
 
 
+def categorical_brier_loss(logits, targets):
+    """Sum squared probability errors over classes, one loss per variable.
+
+    Compute in float32 under autocast. Summing rather than averaging classes
+    keeps the [0, 2] scale independent of the branch's vocabulary size.
+    """
+    probabilities = logits.float().softmax(dim=-1)
+    errors = probabilities.scatter_add(
+        -1,
+        targets.unsqueeze(-1),
+        -torch.ones_like(targets, dtype=probabilities.dtype).unsqueeze(-1),
+    )
+    return errors.square().sum(dim=-1)
+
+
 class DiscreteFlowModule(OptimizedLightningModule):
     def __init__(
         self,
@@ -44,6 +59,7 @@ class DiscreteFlowModule(OptimizedLightningModule):
         conditional_composition=True,
         validation_seed=42,
         label_smoothing=0.0,
+        loss_type="cross_entropy",
     ):
         super().__init__(optimizer_config, "discrete_flow")
         decoder = resolve_config(decoder)
@@ -56,6 +72,11 @@ class DiscreteFlowModule(OptimizedLightningModule):
         self.inf_df_loss_weight = float(inf_df_loss_weight)
         self.mask_loss_by_composition = mask_loss_by_composition
         self.label_smoothing = float(label_smoothing)
+        self.loss_type = loss_type
+        if loss_type not in {"cross_entropy", "brier"}:
+            raise ValueError("loss_type must be 'cross_entropy' or 'brier'")
+        if loss_type == "brier" and self.label_smoothing != 0:
+            raise ValueError("Brier loss requires label_smoothing=0.0")
         if self.zero_df_loss_weight < 0 or self.inf_df_loss_weight < 0:
             raise ValueError("loss weights must be non-negative")
         if not 0 <= self.label_smoothing <= 1:
@@ -146,10 +167,9 @@ class DiscreteFlowModule(OptimizedLightningModule):
         if self.mask_loss_by_composition:
             zero_allowed = data_t.composition[data_t.batch[data_t.zero_dof]] > 0
             zero_allowed[:, 0] = True
-        zero_loss = self._cross_entropy(
+        zero_loss = self._categorical_loss(
             zero_logits,
             batch.x_0_dof.long(),
-            reduction="none",
             allowed=zero_allowed,
         )
         zero_loss = scatter(
@@ -161,11 +181,9 @@ class DiscreteFlowModule(OptimizedLightningModule):
         )
         zero_loss = (zero_loss / variables_per_graph).mean()
 
-        inf_loss = F.cross_entropy(
+        inf_loss = self._categorical_loss(
             raw_inf_logits.flatten(0, 1),
             batch.x_inf_dof.flatten().long(),
-            reduction="none",
-            label_smoothing=self.label_smoothing,
         ).reshape(-1, self.num_elements)
         inf_graph = data_t.batch[~data_t.zero_dof]
         inf_loss = (inf_loss * allowed[inf_graph]).sum(dim=1)
@@ -187,12 +205,16 @@ class DiscreteFlowModule(OptimizedLightningModule):
             "inf_df_loss": inf_loss,
         }
 
-    def _cross_entropy(self, logits, targets, *, reduction, allowed):
-        if self.label_smoothing == 0 or allowed.all():
+    def _categorical_loss(self, logits, targets, *, allowed=None):
+        if self.loss_type == "brier":
+            # Zero logits already carry the composition mask; absent inf
+            # channels are excluded by the per-graph reduction below.
+            return categorical_brier_loss(logits, targets)
+        if self.label_smoothing == 0 or allowed is None or allowed.all():
             return F.cross_entropy(
                 logits,
                 targets,
-                reduction=reduction,
+                reduction="none",
                 label_smoothing=self.label_smoothing,
             )
         masked_logits = logits.masked_fill(

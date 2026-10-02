@@ -1,11 +1,19 @@
+defaults:
+  - override /model/time@_global_.model.time: fourier
+  - _self_
+
 _target_: models.pl_models.crystal_gnn.CrystalGNN
 
 hidden_dim: 256
 element_dim: 128
 num_gnn_layers: 4
 num_heads: 8
+# FFN hidden activations, residual outputs and occupation-head hidden activations.
+# Feature encoders and attention weights do not use dropout.
 dropout: 0.1
 use_symmetry_features: true
 use_composition_residual: true
 use_edge_bias: true
+use_residual_scale: true
+use_condition_silu: false
 predict_all_elements: false

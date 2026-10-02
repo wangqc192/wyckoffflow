@@ -15,6 +15,22 @@ from models.common.utils import PROJECT_ROOT
 log = logging.getLogger(__name__)
 
 
+def build_loggers(config: DictConfig):
+    loggers = []
+    if config.logging.logger:
+        loggers.append(hydra.utils.instantiate(config.logging.logger))
+    if config.logging.get("swanlab"):
+        loggers.append(
+            hydra.utils.instantiate(
+                config.logging.swanlab,
+                hyperparameters=OmegaConf.to_container(config, resolve=True),
+                _recursive_=False,
+                _convert_="all",
+            )
+        )
+    return loggers or False
+
+
 def build_callbacks(config: DictConfig) -> list[pl.Callback]:
     checkpoint = config.train.checkpoint
     directory = (
@@ -90,14 +106,9 @@ def run(config: DictConfig) -> None:
         optimizer_config=config.optim,
         _recursive_=False,
     )
-    logger = (
-        hydra.utils.instantiate(config.logging.logger)
-        if config.logging.logger
-        else False
-    )
     trainer = pl.Trainer(
         default_root_dir=output_dir,
-        logger=logger,
+        logger=build_loggers(config),
         callbacks=build_callbacks(config),
         **config.train.trainer,
     )

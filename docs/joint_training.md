@@ -33,6 +33,8 @@ uv run python -m models.run experiment=joint
 `Linear → LayerNorm → SiLU → Dropout(0.1)`，最终输出层仍为 Linear。
 对应配置为 `model.sg_head.layer_norm=true` 和 `model.sg_head.dropout=0.1`；
 共享成分编码器与候选群 Wyckoff 位置编码器不使用这两个设置。
+空间群头与 `model.decoder.dropout` 独立；关闭整个 Joint 的 dropout 时需同时
+将 `model.sg_head.dropout` 和 `model.decoder.dropout` 设为 `0.0`。
 可分别关闭以做消融：
 
 ```bash
@@ -79,8 +81,9 @@ Linear 权重、embedding 等矩阵参数；bias、LayerNorm 等一维参数的�
 旧的独立模型配置及其 checkpoint 仍按原架构加载；不能将独立模型的
 checkpoint 用作联合模型的 `resume_from`。
 旧 Joint checkpoint 若未保存 `sg_head.layer_norm`、`sg_head.dropout`，加载时
-分别按 `false`、`0.0` 处理，保持原模型结构和预测。新增 LayerNorm 的 Joint
-需要开启新的训练；续训旧 Joint 时使用与其匹配的旧配置，或显式设置
+分别按 `false`、`0.0` 处理，保持原预测；历史 MLP 层编号会自动转换。
+新增 LayerNorm 的 Joint 需要开启新的训练；续训旧 Joint 时使用与其匹配的
+旧配置，或显式设置
 `model.sg_head.layer_norm=false model.sg_head.dropout=0.0`。
 续训时的损失权重也应按原 checkpoint 的配置设置。
 

@@ -3,6 +3,49 @@
 import torch.nn as nn
 
 
+class MLP(nn.Sequential):
+    """Sequential MLP with fixed layer indices for every dropout probability."""
+
+    _version = 2
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Older get_mlp omitted dropout layers in the SG and WyckoffGNN MLPs.
+        # Translate that layout here so callers only handle probabilities.
+        if local_metadata.get("version", 1) < 2:
+            legacy_keys = {}
+            legacy_index = 0
+            for name, layer in self.named_children():
+                if isinstance(layer, nn.Dropout):
+                    continue
+                for key in layer.state_dict():
+                    legacy_keys[f"{prefix}{legacy_index}.{key}"] = (
+                        f"{prefix}{name}.{key}"
+                    )
+                legacy_index += 1
+            saved_keys = {key for key in state_dict if key.startswith(prefix)}
+            if saved_keys == legacy_keys.keys():
+                renamed = {new: state_dict.pop(old) for old, new in legacy_keys.items()}
+                state_dict.update(renamed)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+
 def get_mlp(
     input_dim,
     output_dim,
@@ -11,12 +54,12 @@ def get_mlp(
     activation="SiLU",
     *,
     layer_norm=False,
-    dropout=None,
+    dropout=0.0,
 ):
     """Build exactly ``num_hidden_layers`` hidden blocks and a linear output.
 
-    ``dropout=None`` omits the layer; explicit 0.0 retains Dropout(0) and its
-    Sequential index so existing CrystalGNN checkpoints keep their keys.
+    Each hidden block is Linear -> optional LayerNorm -> activation -> Dropout.
+    Zero disables dropout without changing parameter keys. The output is linear.
     """
     activation_cls = getattr(nn, activation)
     layers = []
@@ -27,7 +70,6 @@ def get_mlp(
         if layer_norm:
             layers.append(nn.LayerNorm(hidden_dim))
         layers.append(activation_cls())
-        if dropout is not None:
-            layers.append(nn.Dropout(dropout))
+        layers.append(nn.Dropout(dropout))
     layers.append(nn.Linear(current_dim, output_dim))
-    return nn.Sequential(*layers)
+    return MLP(*layers)

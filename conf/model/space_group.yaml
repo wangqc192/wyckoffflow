@@ -7,3 +7,5 @@ composition_encoder_dim: 256
 compatibility: true
 mlp_hidden_layers: 3
 mlp_activation: SiLU
+# Hidden activations in the classification and compatibility MLPs.
+dropout: 0.0

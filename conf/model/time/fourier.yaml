@@ -1,0 +1,9 @@
+# @package model.decoder.time
+
+_target_: models.pl_models.time_embedding.FlowTimeEncoder
+num_frequencies: 32
+# Frequencies are multiples of pi.
+min_frequency: 1.0
+max_frequency: 100.0
+include_raw_time: true
+time_scale: 1.0

@@ -1,0 +1,14 @@
+logger:
+  _target_: pytorch_lightning.loggers.CSVLogger
+  save_dir: ${hydra:runtime.output_dir}/logs
+  name: ""
+  version: ""
+
+swanlab:
+  _target_: models.common.swanlab_logger.SwanLabLogger
+  save_dir: ${hydra:runtime.output_dir}
+  project: ${oc.env:SWANLAB_PROJECT,wyckoffflow-pl}
+  workspace: ${oc.env:SWANLAB_WORKSPACE,null}
+  experiment_name: null
+  mode: online
+  id: null

@@ -153,8 +153,15 @@ def make_flow(*overrides):
     )
 
 
-def test_flow_loss_backward_with_positive_counts_and_mixed_precision():
-    model = make_flow()
+@pytest.mark.parametrize(
+    "loss_type,smoothing", [("cross_entropy", 0.05), ("brier", 0.0)]
+)
+def test_flow_loss_backward_with_positive_counts_and_mixed_precision(
+    loss_type, smoothing
+):
+    model = make_flow(
+        f"model.loss_type={loss_type}", f"model.label_smoothing={smoothing}"
+    )
     batch = Batch.from_data_list(
         [make_graph(1, occupied=True), make_graph(2, occupied=True)]
     )
@@ -167,7 +174,7 @@ def test_flow_loss_backward_with_positive_counts_and_mixed_precision():
         model.decoder.element_head,
         model.decoder.budget_encoder,
         model.decoder.symmetry_encoder,
-        model.decoder.layers[0].qkv,
+        model.decoder.layers[0].attention.qkv,
     ):
         gradients = [p.grad for p in module.parameters()]
         assert all(g is not None and torch.isfinite(g).all() for g in gradients)
@@ -205,29 +212,47 @@ def test_flow_sampling_and_exact_composition_decoding(greedy, unmasked):
 @pytest.mark.parametrize(
     "unmasked,legacy", [(False, False), (False, True), (True, False)]
 )
-def test_new_decoder_checkpoint_restores_outputs(tmp_path, unmasked, legacy):
+@pytest.mark.parametrize(
+    "loss_type,smoothing", [("cross_entropy", 0.05), ("brier", 0.0)]
+)
+def test_new_decoder_checkpoint_restores_outputs(
+    tmp_path, unmasked, legacy, loss_type, smoothing
+):
     model = make_flow(
         f"model.mask_loss_by_composition={not unmasked}",
         f"model.decoder.predict_all_elements={unmasked}",
+        f"model.loss_type={loss_type}",
+        f"model.label_smoothing={smoothing}",
     ).eval()
     batch = Batch.from_data_list([make_graph(194, occupied=True)])
     path = tmp_path / "crystal.ckpt"
     hyperparameters = dict(model.hparams)
+    state_dict = model.state_dict()
     if legacy:
         hyperparameters.pop("mask_loss_by_composition")
         hyperparameters["decoder"] = dict(hyperparameters["decoder"])
         hyperparameters["decoder"].pop("predict_all_elements")
+        if loss_type == "cross_entropy":
+            hyperparameters.pop("loss_type")
+        # Older blocks stored the attention projections directly on each layer.
+        state_dict = {
+            key.replace(".attention.", ".").replace(
+                ".adaLN_modulation.1.", ".condition_affine."
+            ): value
+            for key, value in state_dict.items()
+        }
     torch.save(
         {
             "pytorch-lightning_version": pl.__version__,
             "hyper_parameters": hyperparameters,
-            "state_dict": model.state_dict(),
+            "state_dict": state_dict,
         },
         path,
     )
     loaded = DiscreteFlowModule.load_from_checkpoint(path, weights_only=False).eval()
     assert loaded.mask_loss_by_composition == (not unmasked)
     assert loaded.decoder.predict_all_elements == unmasked
+    assert loaded.loss_type == loss_type
     with torch.no_grad():
         before = model.decoder(batch, torch.tensor([0.4]))
         after = loaded.decoder(batch, torch.tensor([0.4]))
@@ -247,6 +272,48 @@ def test_ablation_options_support_backward():
     assert all(
         torch.isfinite(p.grad).all() for p in decoder.parameters() if p.grad is not None
     )
+
+
+def test_residual_scale_ablation_preserves_shared_initialization_and_checkpoint(
+    tmp_path,
+):
+    torch.manual_seed(42)
+    reference = make_flow().eval()
+    reference_rng = torch.get_rng_state()
+    torch.manual_seed(42)
+    ablated = make_flow("model.decoder.use_residual_scale=false").eval()
+    assert torch.equal(torch.get_rng_state(), reference_rng)
+    reference_state = reference.state_dict()
+    ablated_state = ablated.state_dict()
+    assert not any(key.endswith("residual_scale") for key in ablated_state)
+    for key, value in ablated_state.items():
+        torch.testing.assert_close(value, reference_state[key], rtol=0, atol=0)
+    with torch.no_grad():
+        for block in reference.decoder.layers:
+            block.residual_scale.fill_(1)
+    batch = Batch.from_data_list([make_graph(2, occupied=True)])
+    time = torch.tensor([0.5])
+    expected = reference.decoder(batch, time)
+    actual = ablated.decoder(batch, time)
+    for before, after in zip(expected, actual):
+        torch.testing.assert_close(before, after, rtol=0, atol=0)
+    sum(logits.square().sum() for logits in actual).backward()
+    assert all(
+        torch.isfinite(p.grad).all() for p in ablated.parameters() if p.grad is not None
+    )
+    path = tmp_path / "no_residual_scale.ckpt"
+    torch.save(
+        {
+            "pytorch-lightning_version": pl.__version__,
+            "hyper_parameters": dict(ablated.hparams),
+            "state_dict": ablated_state,
+        },
+        path,
+    )
+    restored = DiscreteFlowModule.load_from_checkpoint(path, weights_only=False).eval()
+    assert all(block.residual_scale is None for block in restored.decoder.layers)
+    for before, after in zip(actual, restored.decoder(batch, time)):
+        torch.testing.assert_close(before, after, rtol=0, atol=0)
 
 
 def test_all_element_heads_preserve_present_predictions():
@@ -326,3 +393,60 @@ def test_unmasked_loss_rejects_placeholder_element_outputs():
         hydra.errors.InstantiationException, match="predict_all_elements"
     ):
         make_flow("model.mask_loss_by_composition=false")
+
+
+@pytest.mark.parametrize("masked", [False, True])
+def test_brier_graph_reduction_and_composition_mask(monkeypatch, masked):
+    model = make_flow(
+        "model.loss_type=brier",
+        "model.label_smoothing=0.0",
+        "model.zero_df_loss_weight=2.0",
+        "model.inf_df_loss_weight=3.0",
+        f"model.mask_loss_by_composition={masked}",
+        f"model.decoder.predict_all_elements={not masked}",
+    )
+    graphs = [make_graph(1, occupied=True), make_graph(2, occupied=True)]
+    batch = Batch.from_data_list(graphs)
+    zero = torch.randn(batch.x_0_dof.numel(), 11, requires_grad=True)
+    inf = torch.randn(*batch.x_inf_dof.shape, 9, requires_grad=True)
+    monkeypatch.setattr(model, "decode", lambda *_args: (zero, inf))
+    losses = model(batch)
+    zero_values, inf_values = [], []
+    nz_offset = ni_offset = 0
+    for graph in graphs:
+        nz, ni = int(graph.num_0_dof), int(graph.num_inf_dof)
+        elements = torch.tensor([2, 7]) if masked else torch.arange(10)
+        zlogits = zero[nz_offset : nz_offset + nz]
+        if masked:
+            zlogits = zlogits.masked_fill(
+                ~torch.isin(torch.arange(11), torch.tensor([0, 3, 8])), -torch.inf
+            )
+        ztargets = F.one_hot(graph.x_0_dof, num_classes=11)
+        iprobs = inf[ni_offset : ni_offset + ni, elements].softmax(-1)
+        itargets = F.one_hot(graph.x_inf_dof[:, elements], num_classes=9)
+        variables = nz + ni * len(elements)
+        zero_values.append((zlogits.softmax(-1) - ztargets).square().sum() / variables)
+        inf_values.append((iprobs - itargets).square().sum() / variables)
+        nz_offset += nz
+        ni_offset += ni
+    expected_zero, expected_inf = (
+        torch.stack(zero_values).mean(),
+        torch.stack(inf_values).mean(),
+    )
+    torch.testing.assert_close(losses["zero_df_loss"], expected_zero)
+    torch.testing.assert_close(losses["inf_df_loss"], expected_inf)
+    torch.testing.assert_close(losses["loss"], 2 * expected_zero + 3 * expected_inf)
+    losses["loss"].backward()
+    assert torch.isfinite(zero.grad).all() and torch.isfinite(inf.grad).all()
+    if masked:
+        assert zero.grad[:, 1].count_nonzero() == 0
+        assert inf.grad[:, 0].count_nonzero() == 0
+    else:
+        assert (inf.grad[:, 0, 0] < 0).all()
+
+
+def test_brier_requires_hard_targets():
+    with pytest.raises(
+        hydra.errors.InstantiationException, match="label_smoothing=0.0"
+    ):
+        make_flow("model.loss_type=brier", "model.label_smoothing=0.05")

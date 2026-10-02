@@ -3,7 +3,7 @@ defaults:
   - model: discrete_flow
   - optim: adamw
   - train: default
-  - logging: csv
+  - logging: default
   - _self_
   - experiment: discrete_flow
 

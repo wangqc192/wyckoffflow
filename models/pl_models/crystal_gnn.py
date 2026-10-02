@@ -7,61 +7,26 @@ Only the current noisy occupations and the supplied conditions are read.
 
 import json
 from pathlib import Path
-from typing import NamedTuple
 
+import hydra
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch_geometric.utils import scatter, softmax
+from torch_geometric.utils import scatter
 
 from ..common.lookup_tables import wyckoff_label_to_index
+
+# Keep these names importable for saved Hydra configs and existing callers.
+from .composition_encoder import CompositionFeatures as CompositionFeatures
+from .composition_encoder import CrystalCompositionEncoder as CrystalCompositionEncoder
+from .gnn_block import GnnBlock as GnnBlock
 from .mlp import get_mlp
+from .time_embedding import DiffCSPTimeEncoder as DiffCSPTimeEncoder
+from .time_embedding import FlowTimeEncoder as FlowTimeEncoder
 
 
 def _signed_log1p(value):
     return value.sign() * value.abs().log1p()
-
-
-class CompositionFeatures(NamedTuple):
-    element_embeddings: torch.Tensor
-    element_tokens: torch.Tensor
-    pooled: torch.Tensor
-
-
-class CrystalCompositionEncoder(nn.Module):
-    """Static chemical features shared by space-group and occupation prediction."""
-
-    def __init__(self, num_elements, element_dim, hidden_dim):
-        super().__init__()
-        self.element_embedding = nn.Embedding(num_elements + 1, element_dim)
-        self.token_encoder = get_mlp(
-            element_dim + 2, hidden_dim, hidden_dim, dropout=0.0
-        )
-        self.total_encoder = get_mlp(2, hidden_dim, hidden_dim, dropout=0.0)
-
-    def forward(self, composition):
-        target = composition[:, 1:].float()
-        present = target > 0
-        total = target.sum(dim=-1, keepdim=True).clamp_min(1)
-        species = present.sum(dim=-1, keepdim=True).clamp_min(1)
-        embeddings = self.element_embedding.weight
-        elements = embeddings[1:].unsqueeze(0).expand(target.shape[0], -1, -1)
-        tokens = self.token_encoder(
-            torch.cat(
-                (
-                    elements,
-                    target.log1p().unsqueeze(-1),
-                    (target / total).unsqueeze(-1),
-                ),
-                dim=-1,
-            )
-        )
-        tokens = tokens * present.unsqueeze(-1)
-        pooled = tokens.sum(dim=1) / species
-        pooled = pooled + self.total_encoder(
-            torch.cat((total.log1p(), species.float().log1p()), dim=-1)
-        )
-        return CompositionFeatures(embeddings, tokens, pooled)
 
 
 def _symmetry_table():
@@ -99,77 +64,15 @@ def occupation_counts(data, num_elements):
     return counts, allocated
 
 
-class FlowTimeEncoder(nn.Module):
-    def __init__(self, hidden_dim):
-        super().__init__()
-        self.register_buffer("frequencies", torch.pi * torch.logspace(0, 2, 32))
-        self.projection = get_mlp(66, hidden_dim, hidden_dim, dropout=0.0)
-
-    def forward(self, time):
-        time = time.float().reshape(-1, 1)
-        angles = time * self.frequencies
-        # Raw time distinguishes the endpoints even for periodic features.
-        return self.projection(
-            torch.cat((time, 1 - time, angles.sin(), angles.cos()), dim=-1)
-        )
-
-
-class CrystalAttentionLayer(nn.Module):
-    def __init__(self, hidden_dim, num_heads, dropout, edge_bias):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = hidden_dim // num_heads
-        self.attention_norm = nn.LayerNorm(hidden_dim)
-        self.ffn_norm = nn.LayerNorm(hidden_dim)
-        self.condition_affine = nn.Linear(hidden_dim, 4 * hidden_dim)
-        nn.init.zeros_(self.condition_affine.weight)
-        nn.init.zeros_(self.condition_affine.bias)
-        self.qkv = nn.Linear(hidden_dim, 3 * hidden_dim)
-        self.edge_bias = (
-            get_mlp(7, num_heads, num_heads * 4, dropout=0.0) if edge_bias else None
-        )
-        self.attention_out = nn.Linear(hidden_dim, hidden_dim)
-        self.ffn = get_mlp(hidden_dim, hidden_dim, 4 * hidden_dim, dropout=dropout)
-        self.residual_scale = nn.Parameter(torch.full((2, hidden_dim), 0.1))
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, hidden, condition, edge_index, edge_features):
-        a_scale, a_shift, f_scale, f_shift = self.condition_affine(condition).chunk(
-            4, dim=-1
-        )
-        attention_input = self.attention_norm(hidden) * (1 + a_scale) + a_shift
-        query, key, value = (
-            self.qkv(attention_input)
-            .reshape(-1, 3, self.num_heads, self.head_dim)
-            .unbind(dim=1)
-        )
-        source, target = edge_index
-        # Accumulate attention scores in float32 under mixed precision.
-        score = (query[target].float() * key[source].float()).sum(dim=-1)
-        score = score * self.head_dim**-0.5
-        if self.edge_bias is not None:
-            score = score + self.edge_bias(edge_features).float()
-        weights = softmax(score, target, num_nodes=hidden.shape[0]).to(value.dtype)
-        messages = scatter(
-            weights.unsqueeze(-1) * value[source],
-            target,
-            dim=0,
-            dim_size=hidden.shape[0],
-            reduce="sum",
-        ).flatten(1)
-        hidden = hidden + self.residual_scale[0] * self.dropout(
-            self.attention_out(messages)
-        )
-        ffn_input = self.ffn_norm(hidden) * (1 + f_scale) + f_shift
-        return hidden + self.residual_scale[1] * self.dropout(self.ffn(ffn_input))
-
-
 class CrystalGNN(nn.Module):
     """Drop-in decoder with shared element/count heads and explicit atom budgets.
 
     Composition residuals are soft features, not hard constraints on the noisy
     state: the flow must be able to remove incorrect occupied sites. Element
     masking and exact final composition decoding remain the caller's job.
+
+    ``dropout`` controls attention-layer residuals, FFN hidden activations and
+    occupation-head hidden activations. Feature encoders use no dropout.
     """
 
     def __init__(
@@ -188,6 +91,9 @@ class CrystalGNN(nn.Module):
         continuous_time=True,
         external_composition=False,
         predict_all_elements=False,
+        time=None,
+        use_residual_scale=True,
+        use_condition_silu=False,
     ):
         super().__init__()
         if not conditional_composition or not continuous_time:
@@ -203,47 +109,59 @@ class CrystalGNN(nn.Module):
         self.external_composition = external_composition
         self.predict_all_elements = predict_all_elements
         self.use_composition_residual = use_composition_residual
+
+        # Current occupations and per-element composition budgets.
         self.element_embedding = (
             None
             if external_composition
             else nn.Embedding(num_elements + 1, element_dim)
         )
         self.count_embedding = nn.Embedding(max_num_atoms + 1, element_dim)
-        self.state_encoder = get_mlp(
-            2 * element_dim + 2, hidden_dim, hidden_dim, dropout=0.0
-        )
+        self.state_encoder = get_mlp(2 * element_dim + 2, hidden_dim, hidden_dim)
         self.empty_state = nn.Parameter(torch.zeros(hidden_dim))
         self.budget_encoder = get_mlp(
             3 if external_composition else element_dim + 5,
             hidden_dim,
             hidden_dim,
-            dropout=0.0,
         )
         self.total_encoder = get_mlp(
-            1 if external_composition else 3, hidden_dim, hidden_dim, dropout=0.0
+            1 if external_composition else 3, hidden_dim, hidden_dim
         )
+
+        # Static Wyckoff features and flow time condition every graph layer.
         self.sg_embedding = nn.Embedding(231, hidden_dim)
         self.position_embedding = nn.Embedding(27, hidden_dim)
         self.dof_embedding = nn.Embedding(4, hidden_dim)
         self.multiplicity_embedding = nn.Embedding(193, hidden_dim)
-        self.time_encoder = FlowTimeEncoder(hidden_dim)
+        self.time_encoder = (
+            FlowTimeEncoder(hidden_dim)
+            if time is None
+            else hydra.utils.instantiate(time, hidden_dim=hidden_dim)
+        )
         if use_symmetry_features:
             table = _symmetry_table()
             # Save descriptors in checkpoints so their values are reproducible.
             self.register_buffer("symmetry_features", table)
-            self.symmetry_encoder = get_mlp(
-                table.shape[-1], hidden_dim, hidden_dim, dropout=0.0
-            )
+            self.symmetry_encoder = get_mlp(table.shape[-1], hidden_dim, hidden_dim)
         else:
             self.register_buffer("symmetry_features", None)
             self.symmetry_encoder = None
         self.input_norm = nn.LayerNorm(hidden_dim)
         self.layers = nn.ModuleList(
-            CrystalAttentionLayer(hidden_dim, num_heads, dropout, use_edge_bias)
+            GnnBlock(
+                hidden_dim,
+                num_heads,
+                dropout,
+                use_edge_bias,
+                use_residual_scale=use_residual_scale,
+                use_condition_silu=use_condition_silu,
+            )
             for _ in range(num_gnn_layers)
         )
         self.output_norm = nn.LayerNorm(hidden_dim)
-        self.pair_encoder = get_mlp(5, hidden_dim, hidden_dim, dropout=0.0)
+
+        # Shared heads score each node/element pair and the empty fixed site.
+        self.pair_encoder = get_mlp(5, hidden_dim, hidden_dim)
         self.query_norm = nn.LayerNorm(hidden_dim)
         self.empty_head = get_mlp(hidden_dim, 1, hidden_dim, dropout=dropout)
         self.element_head = get_mlp(hidden_dim, 1, hidden_dim, dropout=dropout)
@@ -251,7 +169,36 @@ class CrystalGNN(nn.Module):
             hidden_dim, max_num_atoms + 1, hidden_dim, dropout=dropout
         )
 
+    def forward(self, data, time, composition_features=None):
+        """Encode conditions, propagate node states, and score occupations.
+
+        Returns fixed-site logits (fixed nodes, elements + vacancy) and
+        variable-site logits (variable nodes, elements, max count + 1).
+        """
+        counts, allocated = occupation_counts(data, self.num_elements)
+        target = data.composition[:, 1:].float()
+        element_tokens, composition = self._encode_budget(
+            target, allocated, composition_features
+        )
+        element_embeddings = (
+            composition_features.element_embeddings
+            if self.external_composition
+            else self.element_embedding.weight
+        )
+        condition = self._encode_condition(data, time, composition)
+        hidden = self.input_norm(
+            self._encode_state(data, counts, element_embeddings) + condition
+        )
+        edge_features = self._edge_features(data)
+        for layer in self.layers:
+            hidden = layer(hidden, condition, data.edge_index, edge_features)
+        hidden = self.output_norm(hidden)
+        return self._predict_occupations(
+            data, hidden, element_tokens, counts, allocated
+        )
+
     def _encode_state(self, data, counts, element_embeddings):
+        """Pool occupied element/count tokens into one vector per node."""
         nodes, elements = counts.nonzero(as_tuple=True)
         occupied = counts[nodes, elements]
         atoms = occupied * data.multiplicities[nodes]
@@ -271,6 +218,7 @@ class CrystalGNN(nn.Module):
         return hidden / species.sqrt() + self.empty_state
 
     def _encode_budget(self, target, allocated, composition_features=None):
+        """Encode target composition and the current global atom budget."""
         present = target > 0
         total = target.sum(dim=-1, keepdim=True).clamp_min(1)
         residual = target - allocated
@@ -282,21 +230,13 @@ class CrystalGNN(nn.Module):
             ),
             dim=-1,
         )
-        if not self.use_composition_residual:
-            dynamic = torch.zeros_like(dynamic)
         current_total = allocated.sum(dim=-1, keepdim=True).log1p()
         if not self.use_composition_residual:
+            dynamic = torch.zeros_like(dynamic)
             current_total = torch.zeros_like(current_total)
         if self.external_composition:
-            # Only the residual branch reads the current noisy occupations.
-            residual_tokens = self.budget_encoder(dynamic)
-            pooled = (residual_tokens * present.unsqueeze(-1)).sum(dim=1)
-            pooled = pooled / present.sum(dim=-1, keepdim=True).clamp_min(1)
-            return (
-                composition_features.element_tokens + residual_tokens,
-                composition_features.pooled
-                + pooled
-                + self.total_encoder(current_total),
+            return self._encode_shared_budget(
+                composition_features, present, dynamic, current_total
             )
         features = torch.cat(
             (target.log1p().unsqueeze(-1), (target / total).unsqueeze(-1), dynamic),
@@ -320,6 +260,16 @@ class CrystalGNN(nn.Module):
         )
         return tokens, pooled + self.total_encoder(totals)
 
+    def _encode_shared_budget(self, features, present, dynamic, current_total):
+        """Add occupation-dependent features to the joint model's static encoding."""
+        residual_tokens = self.budget_encoder(dynamic)
+        pooled = (residual_tokens * present.unsqueeze(-1)).sum(dim=1)
+        pooled = pooled / present.sum(dim=-1, keepdim=True).clamp_min(1)
+        return (
+            features.element_tokens + residual_tokens,
+            features.pooled + pooled + self.total_encoder(current_total),
+        )
+
     @staticmethod
     def _edge_features(data):
         source, target = data.edge_index
@@ -340,17 +290,8 @@ class CrystalGNN(nn.Module):
             dim=-1,
         )
 
-    def forward(self, data, time, composition_features=None):
-        counts, allocated = occupation_counts(data, self.num_elements)
-        target = data.composition[:, 1:].float()
-        element_tokens, composition = self._encode_budget(
-            target, allocated, composition_features
-        )
-        element_embeddings = (
-            composition_features.element_embeddings
-            if self.external_composition
-            else self.element_embedding.weight
-        )
+    def _encode_condition(self, data, time, composition):
+        """Combine Wyckoff descriptors with graph-level composition and time."""
         group = data.space_group.long().reshape(-1)[data.batch]
         position = data.wyckoff_pos_idx.long()
         condition = (
@@ -364,14 +305,11 @@ class CrystalGNN(nn.Module):
             condition = condition + self.symmetry_encoder(
                 self.symmetry_features[group, position]
             )
-        hidden = self.input_norm(
-            self._encode_state(data, counts, element_embeddings) + condition
-        )
-        edge_features = self._edge_features(data)
-        for layer in self.layers:
-            hidden = layer(hidden, condition, data.edge_index, edge_features)
-        hidden = self.output_norm(hidden)
+        return condition
 
+    def _predict_occupations(self, data, hidden, element_tokens, counts, allocated):
+        """Score node/element pairs and assemble the two flow output branches."""
+        target = data.composition[:, 1:].float()
         # Unmasked training needs learned predictions for absent elements too.
         # Otherwise their channels remain placeholders for the caller to mask.
         if self.predict_all_elements:

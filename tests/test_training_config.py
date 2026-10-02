@@ -129,6 +129,25 @@ def test_space_group_experiment_overrides_model_and_epochs():
     assert config.train.trainer.max_epochs == 200
 
 
+def test_standalone_space_group_dropout_config_controls_predictions():
+    config = compose_config(
+        "experiment=space_group",
+        "model.hidden_dim=16",
+        "model.composition_encoder_dim=8",
+        "model.dropout=0.5",
+    )
+    model = hydra.utils.instantiate(
+        config.model, optimizer_config=config.optim, _recursive_=False
+    )
+    composition = formula_to_counts("Li2O2", model.num_elements)[None]
+    assert model.hparams.dropout == 0.5
+    assert not torch.equal(model.predictor(composition), model.predictor(composition))
+    model.eval()
+    torch.testing.assert_close(
+        model.predictor(composition), model.predictor(composition), rtol=0, atol=0
+    )
+
+
 def test_mini_data_group_overrides_only_the_data_path():
     config = compose_config("data=mini")
 

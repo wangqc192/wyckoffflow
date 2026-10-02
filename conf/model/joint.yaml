@@ -1,4 +1,5 @@
 defaults:
+  - time: null
   - decoder: crystal_gnn
   - _self_
 
@@ -24,4 +25,5 @@ sg_head:
   mlp_activation: SiLU
   compatibility: true
   layer_norm: true
+  # Hidden activations in the classification and compatibility MLPs.
   dropout: 0.1

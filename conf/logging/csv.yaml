@@ -1,5 +1,0 @@
-logger:
-  _target_: pytorch_lightning.loggers.CSVLogger
-  save_dir: ${hydra:runtime.output_dir}/logs
-  name: ""
-  version: ""

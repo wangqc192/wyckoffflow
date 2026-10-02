@@ -53,6 +53,46 @@ uv run python -m models.run --multirun \
 命令行覆盖保存在 `.hydra/overrides.yaml`；其他消融开关需通过标签说明。
 仍可用 `hydra.run.dir=...` 显式指定输出路径。
 
+## SwanLab 训练可视化
+
+日志统一配置在 `conf/logging/default.yaml`，默认同时启用 SwanLab（`online`）
+和 CSV 日志，云端项目为 `wyckoffflow-pl`。
+首次使用执行 `uv sync --frozen` 和 `uv run swanlab login`，随后按原命令训练即可。
+训练/验证 loss、周期评估的 GWA 和组成正确率会自动同步；完整训练配置也会记录。
+CSV 仍保存在 `logs/metrics.csv`，SwanLab 日志及实验链接保存在训练目录的
+`swanlab/` 和 `swanlab/run.json`。API Key 通过登录凭据或环境变量读取，不写入配置。
+
+```bash
+# 自定义云端实验名；不指定时采用训练目录名
+uv run python -m models.run logging.swanlab.experiment_name=condition_silu
+
+# 只保存本地日志，之后可使用 SwanLab CLI 上传
+uv run python -m models.run logging.swanlab.mode=offline
+
+# 仅使用原有 CSV 日志
+uv run python -m models.run logging.swanlab=false
+```
+
+项目和工作空间也可通过 `SWANLAB_PROJECT`、`SWANLAB_WORKSPACE` 设置。
+设置 `logging.logger=false logging.swanlab=false` 可关闭全部日志。
+续训时用 `logging.swanlab.id=<原实验ID>` 接回原云端实验；
+ID 可从原目录的 `swanlab/run.json` 获取。
+
+已经运行或结束的 CSV 实验可直接导入，无需重新启动训练：
+
+```bash
+uv run python -m scripts.sync_swanlab \
+  outputs/2026-09-24/09-56-08_discrete_flow --name baseline_0924
+
+# 每 30 秒同步新指标；可用 --stop-file 指定训练启动器的 exit_code 文件
+uv run python -m scripts.sync_swanlab <训练目录> --watch --name condition_silu
+```
+
+同步脚本合并 `resume_*/logs/metrics.csv`，并补充已有的等价模板重建结果。
+曲线横轴使用 CSV 中的训练 step，`epoch` 同时作为指标记录。
+同一项目中重启同步脚本会接回原实验，同步状态保存在 `swanlab/csv_sync_*.json`。
+同步进程的资源占用不代表训练，因此不采集它的硬件监控数据。
+
 ## 训练中的验证集模板重建率
 
 `uv run python -m models.run` 默认在完成第 100、200、300…个 epoch 时，
@@ -133,6 +173,23 @@ uv run python scripts/plot_loss.py outputs
 `model.zero_df_loss_weight=2.0`、`model.inf_df_loss_weight=1.0` 和
 `model.label_smoothing=0.05`。当前默认配置使用 0.05 的标签平滑。
 
+独立离散流可用 `model.loss_type=brier model.label_smoothing=0.0` 切换到
+Brier loss：每个变量的各类别概率与 one-hot 目标的平方差求和，范围为
+0～2。zero/inf 继续共用每个晶体的变量数作为分母，类别维度不额外取平均。
+该目标减轻极端错误的损失，但 softmax 饱和时纠错梯度也可能更弱；是否
+改善生成必须比较相同 epoch、相同采样设置的验证 GWA。
+`val/loss` 在 Brier 实验中记录 Brier，不能与交叉熵的数值直接比较。
+
+~~~bash
+CUDA_VISIBLE_DEVICES=3 uv run --no-sync python -m models.run \
+  model/decoder=crystal_gnn \
+  run_tag=brier \
+  model.loss_type=brier \
+  model.label_smoothing=0.0 \
+  data.datamodule.prototype_sampling_alpha=0 \
+  train.reconstruction.num_samples=4
+~~~
+
 ~~~bash
 uv run python -m models.run \
   model/decoder=wyckoff_gnn \
@@ -164,6 +221,33 @@ decoder 的 `forward(data, time)` 应返回 `(zero_logits, inf_logits)`，形状
 使用 `uv run python -m models.run experiment=joint` 可联合训练空间群预测与
 CrystalGNN 占位流，共享静态成分编码器。训练、联合评估和仅给定成分的采样命令见
 [联合训练说明](docs/joint_training.md)。
+
+### Dropout 配置
+
+Dropout 概率统一使用数值，`0.0` 表示关闭；只在 `model.train()` 时生效，
+`model.eval()` 时关闭。`no_grad()` / `inference_mode()` 本身不会关闭 dropout。
+
+| 配置 | 默认值 | 生效位置 |
+| --- | --- | --- |
+| CrystalGNN：`model.decoder.dropout` | 0.1 | 注意力残差输出、FFN 隐藏激活和残差输出、占位预测头隐藏激活 |
+| Joint 空间群头：`model.sg_head.dropout` | 0.1 | 直接分类和兼容性评分 MLP 的隐藏激活 |
+| 独立空间群模型：`model.dropout` | 0.0 | 直接分类和兼容性评分 MLP 的隐藏激活 |
+
+上述配置互相独立，均不作用于组成、时间、对称性等特征编码器，也不对最终
+logits 做 dropout。CrystalGNN 的注意力权重不做 dropout；FFN 隐藏激活与
+残差输出处的两次 dropout 作用于不同位置。原 `wyckoff_gnn` 不使用 dropout。
+独立的 chemical SG、neural fusion 和 flow SG scorer 沿用各自的 dropout 参数。
+
+例如，关闭 Joint 模型全部 dropout：
+
+```bash
+uv run python -m models.run experiment=joint \
+  model.decoder.dropout=0.0 model.sg_head.dropout=0.0
+```
+
+共享 `get_mlp` 固定使用 `Linear → 可选 LayerNorm → 激活 → Dropout` 隐藏块，
+最后一层为 Linear。关闭 dropout 保留 `Dropout(0)`，因此切换概率不会改变
+参数键名；历史 MLP 中省略 dropout 层的检查点会在加载时自动转换层编号。
 
 ## 模型评估
 

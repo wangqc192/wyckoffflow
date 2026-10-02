@@ -18,6 +18,7 @@ class SpaceGroupModule(OptimizedLightningModule):
         mlp_activation,
         composition_encoder_dim=None,
         compatibility=False,
+        dropout=0.0,
     ):
         super().__init__(optimizer_config, "space_group")
         self.save_hyperparameters(ignore=["optimizer_config"])

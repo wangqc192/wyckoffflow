@@ -1,7 +1,40 @@
 # CrystalGNN：面向 Wyckoff 模板生成的图网络
 
-实现位于 `models/pl_models/crystal_gnn.py`，配置为
-`conf/model/decoder/crystal_gnn.yaml`。通过现有 decoder 接口接入
+从 `models/pl_models/crystal_gnn.py` 的 `CrystalGNN.forward()` 开始阅读：
+先编码当前占据和组成预算，再叠加 Wyckoff 特征与时间条件，经过图传播后输出两个分支的 logits。
+
+| 文件（`models/pl_models/`） | 职责 |
+| --- | --- |
+| `crystal_gnn.py` | 组织主流程；编码占据、组成预算和 Wyckoff 条件；预测固定/可变位置的占据 |
+| `composition_encoder.py` | 联合训练共享的静态组成编码，不读取当前噪声占据 |
+| `time_embedding.py` | Fourier 与 DiffCSP 时间编码 |
+| `gnn_block.py` | 条件归一化、attention/FFN 残差、旧 block 参数名转换 |
+| `attention.py` | QKV、多头边注意力、消息聚合和输出投影 |
+
+```mermaid
+flowchart TD
+    A[当前占据] --> B[位点状态编码]
+    A --> C[组成预算编码]
+    D[目标组成] --> C
+    C --> E[Wyckoff + 时间 + 组成条件]
+    B --> F[GNN blocks]
+    E --> F
+    F --> G[位点与元素配对预测]
+    C --> G
+    A --> G
+    G --> H[固定位置：空位或元素]
+    G --> I[可变位置：各元素轨道计数]
+```
+
+`_encode_budget()` 处理独立模型的组成编码；联合模型通过
+`_encode_shared_budget()` 在已缓存的静态编码上添加当前分配量和残差。
+`_encode_condition()` 组合逐节点条件，`_predict_occupations()` 负责元素配对和输出拼装。
+输出元素掩码、损失及最终计数守恒解码由 flow 调用方处理。
+
+组件拆分保留参数名称和初始化顺序，旧配置中的 `crystal_gnn.FlowTimeEncoder`、
+`crystal_gnn.DiffCSPTimeEncoder` 导入路径仍可用。更早的注意力和条件调制参数名
+继续由 `GnnBlock` 加载钩子转换。
+配置为 `conf/model/decoder/crystal_gnn.yaml`。通过现有 decoder 接口接入
 `DiscreteFlowModule`，需要从头训练新网络。
 
 ## 设计依据
@@ -43,6 +76,18 @@
 uv run python -m models.run model/decoder=crystal_gnn
 ```
 
+时间编码配置位于 `conf/model/time/`，默认使用 `fourier.yaml`。
+切换到 DiffCSP 正弦编码：
+
+```bash
+uv run python -m models.run model/decoder=crystal_gnn model/time=diffcsp
+```
+
+频率数量、频率范围或最大周期、时间缩放均在对应 YAML 中设置；例如
+`model.decoder.time.time_scale=1.0`。时间编码的输出维度跟随 decoder 的
+`hidden_dim`。默认 Fourier 使用 32 对 sin/cos 加 t、1−t，DiffCSP 使用 33 对
+sin/cos；两者输入投影均为 66 维，便于保持参数量一致做对照。
+
 默认 4 层、hidden=256、元素维度 128、8 个注意力头、dropout=0.1。
 在默认 100 种元素、最大轨道计数 54 的配置下，可训练参数约 520 万，
 原 `wyckoff_gnn` 约 1,677 万；主要节省来自跨元素共享输出头。
@@ -67,6 +112,16 @@ uv run python -m models.run \
 另外两个开关是 `use_symmetry_features`、`use_edge_bias`。
 关闭组成残差时仍保留目标组成与节点自身当前占据，只移除显式全局分配量和残差。
 可通过 `model.decoder.dropout=0.0` 检查正则化的影响。
+该参数作用于 FFN 隐藏激活、注意力与 FFN 的残差输出，以及三个占位预测头的
+隐藏激活；特征编码器、注意力权重和最终 logits 不做 dropout。
+FFN 隐藏激活与残差输出使用独立的 dropout；评估时均由 `model.eval()` 关闭。
+
+`model.decoder.use_residual_scale=false` 可从头训练不含可学习残差缩放的对照。
+关闭后 attention 和 FFN 分支直接加回主干，不创建缩放参数；默认仍启用，初始值为 0.1。
+
+`model.decoder.use_condition_silu=true` 将 `adaLN_modulation` 配成
+`nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, 4 * hidden_dim))`，保留 Linear
+的零初始化和原来的残差缩放。该选项默认关闭，使用 Identity → Linear；适合作为独立消融。
 
 ## 如何判断效果
 

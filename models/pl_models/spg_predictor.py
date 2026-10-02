@@ -93,7 +93,7 @@ class SpaceGroupHead(nn.Module):
             config["mlp_hidden_layers"],
             config["mlp_activation"],
             layer_norm=config.get("layer_norm", False),
-            dropout=config.get("dropout", 0.0) or None,
+            dropout=config.get("dropout", 0.0),
         )
 
         use_compatibility = config.get(
@@ -109,7 +109,7 @@ class SpaceGroupHead(nn.Module):
                 config["mlp_hidden_layers"],
                 config["mlp_activation"],
                 layer_norm=config.get("layer_norm", False),
-                dropout=config.get("dropout", 0.0) or None,
+                dropout=config.get("dropout", 0.0),
             )
             nn.init.zeros_(self.compatibility_mlp[-1].weight)
             nn.init.zeros_(self.compatibility_mlp[-1].bias)
