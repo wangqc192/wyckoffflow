@@ -7,4 +7,4 @@ experiment_name: joint
 model_label: ${hydra:runtime.choices.model/decoder}_h${model.decoder.hidden_dim}_l${model.decoder.num_gnn_layers}_sgw${model.sg_loss_weight}_floww${model.flow_loss_weight}
 train:
   reconstruction:
-    predicted_space_groups: 5
+    predicted_space_groups: 4

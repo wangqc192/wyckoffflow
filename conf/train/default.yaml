@@ -20,8 +20,8 @@ checkpoint:
 reconstruction:
   enabled: true
   every_n_epochs: 100
-  num_samples: 20
+  num_samples: 4
   flow_steps: 50
-  batch_size: 128
+  batch_size: 256
   cpu_workers: 8
   seed: ${seed}

@@ -130,6 +130,47 @@ def test_time_endpoints_and_composition_amount_affect_predictions():
     assert not torch.allclose(at_zero[:, 7], doubled[:, 7])
 
 
+@pytest.mark.parametrize("external_composition", [False, True])
+def test_global_composition_encoder_ablation_preserves_initialization_and_only_removes_branch(
+    external_composition,
+):
+    from models.pl_models.composition_encoder import CrystalCompositionEncoder
+
+    baseline = make_decoder(external_composition=external_composition).eval()
+    baseline_rng = torch.random.get_rng_state()
+    ablated = make_decoder(
+        external_composition=external_composition, use_global_composition_encoder=False
+    ).eval()
+    assert torch.equal(torch.random.get_rng_state(), baseline_rng)
+    assert ablated.global_composition_encoder is None
+    for name, value in ablated.state_dict().items():
+        torch.testing.assert_close(value, baseline.state_dict()[name], rtol=0, atol=0)
+
+    batch = Batch.from_data_list([make_graph(2, occupied=True), make_graph(194)])
+    features = (
+        CrystalCompositionEncoder(10, 16, 32)(batch.composition)
+        if external_composition
+        else None
+    )
+    time = torch.tensor([0.2, 0.8])
+    original = baseline(batch, time, features)
+    hook = baseline.global_composition_encoder.register_forward_hook(
+        lambda module, args, output: torch.zeros_like(output)
+    )
+    removed = baseline(batch, time, features)
+    hook.remove()
+    actual = ablated(batch, time, features)
+    for expected, result in zip(removed, actual):
+        torch.testing.assert_close(expected, result, rtol=0, atol=0)
+    assert any(
+        not torch.allclose(before, after) for before, after in zip(original, actual)
+    )
+    sum(logits.square().mean() for logits in actual).backward()
+    gradients = [parameter.grad for parameter in ablated.budget_encoder.parameters()]
+    assert all(grad is not None and torch.isfinite(grad).all() for grad in gradients)
+    assert any(grad.count_nonzero() for grad in gradients)
+
+
 def make_flow(*overrides):
     with initialize_config_dir(
         config_dir=str(PROJECT_ROOT / "conf"), version_base="1.3"
@@ -230,6 +271,7 @@ def test_new_decoder_checkpoint_restores_outputs(
     state_dict = model.state_dict()
     if legacy:
         hyperparameters.pop("mask_loss_by_composition")
+        hyperparameters["normalize_loss_by_variables"] = True
         hyperparameters["decoder"] = dict(hyperparameters["decoder"])
         hyperparameters["decoder"].pop("predict_all_elements")
         if loss_type == "cross_entropy":
@@ -377,7 +419,7 @@ def test_unmasked_loss_counts_all_elements_and_averages_per_crystal(monkeypatch)
             reduction="sum",
             label_smoothing=model.label_smoothing,
         )
-        per_graph.append(total / (nz + ni * 10))
+        per_graph.append(total)
         nz_offset += nz
         ni_offset += ni
     torch.testing.assert_close(loss, torch.stack(per_graph).mean())
@@ -396,9 +438,10 @@ def test_unmasked_loss_rejects_placeholder_element_outputs():
 
 
 @pytest.mark.parametrize("masked", [False, True])
-def test_brier_graph_reduction_and_composition_mask(monkeypatch, masked):
+@pytest.mark.parametrize("loss_type", ["cross_entropy", "brier"])
+def test_graph_loss_reduction_and_composition_mask(monkeypatch, masked, loss_type):
     model = make_flow(
-        "model.loss_type=brier",
+        f"model.loss_type={loss_type}",
         "model.label_smoothing=0.0",
         "model.zero_df_loss_weight=2.0",
         "model.inf_df_loss_weight=3.0",
@@ -421,12 +464,19 @@ def test_brier_graph_reduction_and_composition_mask(monkeypatch, masked):
             zlogits = zlogits.masked_fill(
                 ~torch.isin(torch.arange(11), torch.tensor([0, 3, 8])), -torch.inf
             )
-        ztargets = F.one_hot(graph.x_0_dof, num_classes=11)
-        iprobs = inf[ni_offset : ni_offset + ni, elements].softmax(-1)
-        itargets = F.one_hot(graph.x_inf_dof[:, elements], num_classes=9)
-        variables = nz + ni * len(elements)
-        zero_values.append((zlogits.softmax(-1) - ztargets).square().sum() / variables)
-        inf_values.append((iprobs - itargets).square().sum() / variables)
+        ilogits = inf[ni_offset : ni_offset + ni, elements]
+        ztargets = graph.x_0_dof
+        itargets = graph.x_inf_dof[:, elements]
+        if loss_type == "brier":
+            zloss = (zlogits.softmax(-1) - F.one_hot(ztargets, 11)).square().sum()
+            iloss = (ilogits.softmax(-1) - F.one_hot(itargets, 9)).square().sum()
+        else:
+            zloss = F.cross_entropy(zlogits, ztargets, reduction="sum")
+            iloss = F.cross_entropy(
+                ilogits.reshape(-1, 9), itargets.flatten(), reduction="sum"
+            )
+        zero_values.append(zloss)
+        inf_values.append(iloss)
         nz_offset += nz
         ni_offset += ni
     expected_zero, expected_inf = (

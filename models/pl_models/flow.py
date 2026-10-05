@@ -121,7 +121,7 @@ class DiscreteFlowModule(OptimizedLightningModule):
         return self.decoder(data, time, composition_features=composition_features)
 
     def flow_loss(self, batch, composition_features=None):
-        """Corrupt occupations and train the decoder against the clean template."""
+        """Corrupt occupations; sum losses per graph, then average over the batch."""
         data_t = batch.clone()
         batch_size = batch.num_graphs
         time = torch.rand(batch_size, device=self.device)
@@ -161,8 +161,6 @@ class DiscreteFlowModule(OptimizedLightningModule):
             allowed = torch.ones(
                 (batch_size, self.num_elements), dtype=torch.bool, device=self.device
             )
-        variables_per_graph = batch.num_0_dof + batch.num_inf_dof * allowed.sum(dim=1)
-
         zero_allowed = torch.ones_like(zero_logits, dtype=torch.bool)
         if self.mask_loss_by_composition:
             zero_allowed = data_t.composition[data_t.batch[data_t.zero_dof]] > 0
@@ -179,7 +177,7 @@ class DiscreteFlowModule(OptimizedLightningModule):
             dim_size=batch_size,
             reduce="sum",
         )
-        zero_loss = (zero_loss / variables_per_graph).mean()
+        zero_loss = zero_loss.mean()
 
         inf_loss = self._categorical_loss(
             raw_inf_logits.flatten(0, 1),
@@ -194,7 +192,7 @@ class DiscreteFlowModule(OptimizedLightningModule):
             dim_size=batch_size,
             reduce="sum",
         )
-        inf_loss = (inf_loss / variables_per_graph).mean()
+        inf_loss = inf_loss.mean()
 
         return {
             "loss": (

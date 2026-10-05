@@ -5,6 +5,7 @@ import torch.nn as nn
 from torch_geometric.nn.conv import MessagePassing
 from torch_geometric.utils import softmax
 
+from .composition_encoder import _load_legacy_global_composition
 from .mlp import get_mlp
 
 
@@ -41,13 +42,14 @@ class CompositionSetEncoder(nn.Module):
             num_hidden_layers,
             activation,
         )
-        self.total_encoder = get_mlp(
+        self.global_composition_encoder = get_mlp(
             1,
             output_dim,
             hidden_dim,
             num_hidden_layers,
             activation,
         )
+        self._register_load_state_dict_pre_hook(_load_legacy_global_composition)
 
     def forward(self, composition):
         counts = composition[:, 1:].float()
@@ -66,7 +68,7 @@ class CompositionSetEncoder(nn.Module):
         )
         encoded = self.token_encoder(tokens) * present.unsqueeze(-1)
         pooled = encoded.sum(dim=1) / present.sum(dim=1, keepdim=True).clamp_min(1)
-        return pooled + self.total_encoder(total.log1p())
+        return pooled + self.global_composition_encoder(total.log1p())
 
 
 class CompositionFiLM(nn.Module):

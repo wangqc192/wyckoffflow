@@ -234,10 +234,10 @@ def test_nonzero_rank_logs_broadcast_metrics_without_sampling(tmp_path):
     callback.on_validation_epoch_end(trainer, model)
     assert logged == {
         "val/gwa_top1": 0.6,
-        "val/gwa_top20": 0.8,
+        "val/gwa_top4": 0.8,
         "val/composition_accuracy": 1.0,
         "val/gwa_top1_no_composition": 0.3,
-        "val/gwa_top20_no_composition": 0.5,
+        "val/gwa_top4_no_composition": 0.5,
         "val/composition_accuracy_no_composition": 0.7,
     }
     assert not (tmp_path / "reconstruction").exists()
@@ -265,14 +265,14 @@ def test_training_saves_periodic_metrics_and_best_gwa_and_resumes(
                 callback
                 for callback in model.trainer.callbacks
                 if isinstance(callback, ModelCheckpoint)
-                and callback.monitor == "val/gwa_top20"
+                and callback.monitor == "val/gwa_top4"
             )
             assert best_gwa.best_model_score.item() == pytest.approx(0.8)
             best_raw = next(
                 callback
                 for callback in model.trainer.callbacks
                 if isinstance(callback, ModelCheckpoint)
-                and callback.monitor == "val/gwa_top20_no_composition"
+                and callback.monitor == "val/gwa_top4_no_composition"
             )
             assert best_raw.best_model_score.item() == pytest.approx(0.5)
         # A worse later reconstruction must not replace the best checkpoint.
@@ -336,10 +336,10 @@ def test_training_saves_periodic_metrics_and_best_gwa_and_resumes(
         "epoch_0003",
     ]
     metrics = pd.read_csv(Path(trainer.logger.log_dir) / "metrics.csv")
-    recorded = metrics.dropna(subset=["val/gwa_top20"])
+    recorded = metrics.dropna(subset=["val/gwa_top4"])
     assert recorded.epoch.tolist() == [1, 3]
-    assert np.allclose(recorded["val/gwa_top20"], [0.8, 0.6])
-    assert np.allclose(recorded["val/gwa_top20_no_composition"], [0.3, 0.5])
+    assert np.allclose(recorded["val/gwa_top4"], [0.8, 0.6])
+    assert np.allclose(recorded["val/gwa_top4_no_composition"], [0.3, 0.5])
 
     config.resume_from = str(directory / "last.ckpt")
     resumed_callbacks = build_callbacks(config)
