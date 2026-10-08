@@ -6,12 +6,12 @@ defaults:
 _target_: models.pl_models.flow.DiscreteFlowModule
 
 num_elements: ${data.num_elements}
-max_num_atoms: 54
+max_num_atoms: 14
 flow_source: zeros
 zero_df_loss_weight: 1.0
 inf_df_loss_weight: 1.0
 loss_type: cross_entropy
-label_smoothing: 0.05
+label_smoothing: 0.00
 conditional_composition: true
 mask_loss_by_composition: true
 
