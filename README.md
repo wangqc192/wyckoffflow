@@ -42,7 +42,7 @@ SG / Flow 损失权重 `sgw` / `floww`。这些数值随实际配置自动更新
 
 ```bash
 uv run python -m models.run \
-  run_tag=no_film model.decoder.composition_film=false
+  run_tag=no_edge_bias model.decoder.use_edge_bias=false
 
 uv run python -m models.run --multirun \
   run_tag=capacity model.decoder.num_gnn_layers=3,6 model.decoder.hidden_dim=256,512
@@ -167,11 +167,11 @@ uv run python scripts/plot_loss.py outputs
 ## 图网络配置与消融
 
 参考 DiffCSP，decoder 使用独立的 Hydra 配置组
-`conf/model/decoder/`，默认是 `wyckoff_gnn.yaml`。网络层数、隐藏维度、
-组成编码、FiLM 和 MLP 等参数放在 `model.decoder` 中；source、损失权重等
+`conf/model/decoder/`，默认是 `crystal_gnn.yaml`。网络层数、隐藏维度、
+注意力头数、dropout 和组成残差等参数放在 `model.decoder` 中；source、损失权重等
 直接放在 `model` 中，例如
 `model.zero_df_loss_weight=2.0`、`model.inf_df_loss_weight=1.0` 和
-`model.label_smoothing=0.05`。当前默认配置使用 0.05 的标签平滑。
+`model.label_smoothing=0.05`。当前默认配置关闭标签平滑（`0.0`）。
 
 独立离散流可用 `model.loss_type=brier model.label_smoothing=0.0` 切换到
 Brier loss：每个变量的各类别概率与 one-hot 目标的平方差求和，范围为
@@ -192,14 +192,14 @@ CUDA_VISIBLE_DEVICES=3 uv run --no-sync python -m models.run \
 
 ~~~bash
 uv run python -m models.run \
-  model/decoder=wyckoff_gnn \
+  model/decoder=crystal_gnn \
   model.decoder.num_gnn_layers=6 \
   model.decoder.hidden_dim=512
 
-# 对层数和 FiLM 做组合消融
+# 对层数和 dropout 做组合消融
 uv run python -m models.run --multirun \
   model.decoder.num_gnn_layers=2,3,6 \
-  model.decoder.composition_film=true,false
+  model.decoder.dropout=0.0,0.1
 ~~~
 
 新增图网络时，在 `conf/model/decoder/<name>.yaml` 中配置该网络的 `_target_`
@@ -209,13 +209,13 @@ decoder 的 `forward(data, time)` 应返回 `(zero_logits, inf_logits)`，形状
 `[零自由度节点数, num_elements + 1]` 和
 `[非零自由度节点数, num_elements, max_num_atoms + 1]`。
 
-`mlp_hidden_layers` 直接表示隐藏层数，不包括最终 Linear 输出层。
-当前默认值为 3，保持原网络深度。历史配置采用“额外隐藏层数”语义，复用时需将
-旧值加 1；旧 checkpoint 内嵌的对应配置（`sg_head`、`decoder` 或独立 SG 的顶层
+空间群模型的 `mlp_hidden_layers` 直接表示隐藏层数，不包括最终 Linear 输出层。
+当前默认值为 3。历史配置采用“额外隐藏层数”语义，复用时需将
+旧值加 1；旧 checkpoint 内嵌的对应配置（`sg_head` 或独立 SG 的顶层
 `mlp_hidden_layers`）也需同步修改或在加载时覆盖，仅修改 `conf/` 不会更新这些值。
 
-新增的 `crystal_gnn` 使用 Wyckoff 对称性描述符、组成残差、多头图注意力和
-跨元素共享计数预测头。用 `model/decoder=crystal_gnn` 启动独立训练；
+`crystal_gnn` 使用 Wyckoff 对称性描述符、组成残差、多头图注意力和
+跨元素共享计数预测头，是独立 Flow 和联合模型的默认 decoder；
 设计、消融和评估口径见 [CrystalGNN 说明](docs/crystal_gnn.md)。
 
 使用 `uv run python -m models.run experiment=joint` 可联合训练空间群预测与
@@ -235,7 +235,7 @@ Dropout 概率统一使用数值，`0.0` 表示关闭；只在 `model.train()` �
 
 上述配置互相独立，均不作用于组成、时间、对称性等特征编码器，也不对最终
 logits 做 dropout。CrystalGNN 的注意力权重不做 dropout；FFN 隐藏激活与
-残差输出处的两次 dropout 作用于不同位置。原 `wyckoff_gnn` 不使用 dropout。
+残差输出处的两次 dropout 作用于不同位置。
 独立的 chemical SG、neural fusion 和 flow SG scorer 沿用各自的 dropout 参数。
 
 例如，关闭 Joint 模型全部 dropout：

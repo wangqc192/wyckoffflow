@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 from ..common import lookup_tables
-from .gnn import CompositionSetEncoder
+from .composition_encoder import CrystalCompositionEncoder
 from .mlp import get_mlp
 
 
@@ -149,12 +149,14 @@ class SpaceGroupPredictor(SpaceGroupHead):
             "spg_composition_encoder_dim", config.get("composition_encoder_dim")
         )
         composition_encoder = (
-            CompositionSetEncoder(
+            CrystalCompositionEncoder(
                 num_elements,
                 encoder_dim,
-                2 * encoder_dim,
-                config["mlp_hidden_layers"],
-                config["mlp_activation"],
+                encoder_dim,
+                mlp_hidden_dim=2 * encoder_dim,
+                num_hidden_layers=config["mlp_hidden_layers"],
+                activation=config["mlp_activation"],
+                include_species_count=False,
             )
             if encoder_dim is not None
             else None
@@ -169,7 +171,7 @@ class SpaceGroupPredictor(SpaceGroupHead):
     def encode(self, composition):
         if self.composition_encoder is None:
             return composition.float().log1p()
-        return self.composition_encoder(composition)
+        return self.composition_encoder(composition).pooled
 
     def forward(self, composition):
         return super().forward(self.encode(composition))

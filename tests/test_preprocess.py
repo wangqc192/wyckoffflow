@@ -157,8 +157,8 @@ def test_alex_config_trains_without_test_csv(cif_frame, tmp_path):
                 "data.preprocess.num_workers=0",
                 "model.decoder.num_gnn_layers=1",
                 "model.decoder.hidden_dim=8",
-                "model.decoder.dof_pos_sg_emb_size=4",
-                "model.decoder.composition_encoder_dim=4",
+                "model.decoder.element_dim=4",
+                "model.decoder.num_heads=2",
             ],
         )
     datamodule = hydra.utils.instantiate(config.data.datamodule, _recursive_=False)

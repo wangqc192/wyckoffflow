@@ -6,7 +6,7 @@
 | 文件（`models/pl_models/`） | 职责 |
 | --- | --- |
 | `crystal_gnn.py` | 组织主流程；编码占据、组成预算和 Wyckoff 条件；预测固定/可变位置的占据 |
-| `composition_encoder.py` | 联合训练共享的静态组成编码，不读取当前噪声占据 |
+| `composition_encoder.py` | 独立 SG 与联合训练使用的静态组成编码，不读取当前噪声占据 |
 | `time_embedding.py` | Fourier 与 DiffCSP 时间编码 |
 | `gnn_block.py` | 条件归一化、attention/FFN 残差、旧 block 参数名转换 |
 | `attention.py` | QKV、多头边注意力、消息聚合和输出投影 |
@@ -31,11 +31,15 @@ flowchart TD
 `_encode_condition()` 组合逐节点条件，`_predict_occupations()` 负责元素配对和输出拼装。
 输出元素掩码、损失及最终计数守恒解码由 flow 调用方处理。
 
+静态组成编码统一使用 `CrystalCompositionEncoder`，返回
+`CompositionFeatures(element_embeddings, element_tokens, pooled)`。
+独立 SG 取 `.pooled`，联合模型将完整特征同时提供给 SG 头和 CrystalGNN。
+编码器可配置 MLP 宽度、层数、激活和是否编码元素种类数，保留各模型的参数布局。
+
 组件拆分保留参数名称和初始化顺序，旧配置中的 `crystal_gnn.FlowTimeEncoder`、
 `crystal_gnn.DiffCSPTimeEncoder` 导入路径仍可用。更早的注意力和条件调制参数名
 继续由 `GnnBlock` 加载钩子转换。
-配置为 `conf/model/decoder/crystal_gnn.yaml`。通过现有 decoder 接口接入
-`DiscreteFlowModule`，需要从头训练新网络。
+配置为 `conf/model/decoder/crystal_gnn.yaml`，是 `DiscreteFlowModule` 的默认 decoder。
 
 ## 设计依据
 
@@ -89,19 +93,10 @@ uv run python -m models.run model/decoder=crystal_gnn model/time=diffcsp
 sin/cos；两者输入投影均为 66 维，便于保持参数量一致做对照。
 
 默认 4 层、hidden=256、元素维度 128、8 个注意力头、dropout=0.1。
-在默认 100 种元素、最大轨道计数 54 的配置下，可训练参数约 520 万，
-原 `wyckoff_gnn` 约 1,677 万；主要节省来自跨元素共享输出头。
-其余训练、损失、采样和验证配置继承现有默认值。旧 `gnn.py` 检查点不适用于
-这个新架构；请启动独立训练目录，不要用旧检查点作为 `resume_from`。
+在 100 种元素、最大轨道计数 54 的配置下，可训练参数约 520 万，
+使用跨元素共享输出头。其余训练、损失、采样和验证配置继承现有默认值。
 
-对照旧网络时保持数据、种子、训练轮数、优化器、损失权重和采样预算一致：
-
-```bash
-uv run python -m models.run --multirun \
-  model/decoder=wyckoff_gnn,crystal_gnn
-```
-
-新网络提供三个独立特征开关，便于逐项消融，例如：
+网络提供三个独立特征开关，便于逐项消融，例如：
 
 ```bash
 uv run python -m models.run \

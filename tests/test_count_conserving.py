@@ -4,12 +4,12 @@ import pytest
 import torch
 from torch_geometric.data import Batch, Data
 from torch_geometric.loader import DataLoader
-from wyckoff_generation.common.composition import decode_composition
 
 import models.sampling as sampling
 import scripts.sample_wy as sample_wy
 from models.common.composition import formula_to_counts
 from models.pl_models.count_conserving import _graph_offsets, cpu_dp_worker_count
+from models.pl_models.crystal_gnn import occupation_counts
 from models.pl_models.flow import DiscreteFlowModule
 from models.pl_models.model_utils import (
     create_wyckoff_graph,
@@ -35,18 +35,12 @@ MODEL_CONFIG = {
 }
 
 DECODER_CONFIG = {
-    "_target_": "models.pl_models.gnn.WyckoffGNN",
-    "composition_encoder_dim": 4,
-    "composition_film": False,
+    "_target_": "models.pl_models.crystal_gnn.CrystalGNN",
     "num_gnn_layers": 1,
     "hidden_dim": 8,
-    "dof_pos_sg_emb_size": 4,
-    "gnn_activation": "SiLU",
-    "no_multiplicity_encoding": False,
-    "binary_dof_encoding": False,
-    "no_softmax": False,
-    "mlp_hidden_layers": 2,
-    "mlp_activation": "SiLU",
+    "element_dim": 4,
+    "num_heads": 2,
+    "dropout": 0.0,
 }
 
 
@@ -111,8 +105,8 @@ def test_sample_uses_final_logits_for_exact_composition():
     assert sampled.x_0_dof.device.type == "cpu"
     assert sampled.x_inf_dof.device.type == "cpu"
     assert sampled.x_0_dof.dtype == torch.long
-    decoded = decode_composition(sampled, 118).round().long()
-    assert torch.equal(decoded, sampled.composition.round().long())
+    _, decoded = occupation_counts(sampled, 118)
+    assert torch.equal(decoded.round().long(), sampled.composition[:, 1:].round().long())
 
 
 def test_saved_logits_share_a_cpu_pool_across_batches():
@@ -135,9 +129,9 @@ def test_saved_logits_share_a_cpu_pool_across_batches():
 
     generated = result.samples
     assert len(generated) == 4
-    decoded = decode_composition(Batch.from_data_list(generated), 118).round().long()
-    targets = Batch.from_data_list(generated).composition.round().long()
-    assert torch.equal(decoded, targets)
+    sampled = Batch.from_data_list(generated)
+    _, decoded = occupation_counts(sampled, 118)
+    assert torch.equal(decoded.round().long(), sampled.composition[:, 1:].round().long())
     for sample in generated:
         expected_x = create_x_matrix(sample.x_inf_dof, sample.x_0_dof, sample.zero_dof)
         assert torch.equal(sample.x, expected_x)
@@ -333,7 +327,7 @@ def test_shared_sampler_decodes_all_modes_without_mutating_flow_state(
     if enforce_composition:
         sampled = Batch.from_data_list(result.samples)
         assert torch.equal(
-            decode_composition(sampled, 118).round(), sampled.composition
+            occupation_counts(sampled, 118)[1].round(), sampled.composition[:, 1:]
         )
     if sampling_mode == "top-n":
         scores = [float(sample.decoder_log_score) for sample in result.samples]
@@ -449,7 +443,7 @@ def test_greedy_zero_source_is_repeatable_and_cached_decode_agrees(
     if enforce_composition:
         sampled = Batch.from_data_list(results)
         torch.testing.assert_close(
-            decode_composition(sampled, 118).round(), sampled.composition
+            occupation_counts(sampled, 118)[1].round(), sampled.composition[:, 1:]
         )
 
     logits_path = tmp_path / "greedy.logits.pt"

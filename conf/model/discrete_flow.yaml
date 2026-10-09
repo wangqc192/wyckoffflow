@@ -1,6 +1,6 @@
 defaults:
   - time: null
-  - decoder: wyckoff_gnn
+  - decoder: crystal_gnn
   - _self_
 
 _target_: models.pl_models.flow.DiscreteFlowModule

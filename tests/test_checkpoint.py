@@ -4,6 +4,7 @@ import torch
 from omegaconf import OmegaConf
 
 from models.common.checkpoint import load_model
+from models.common.composition import formula_to_counts
 from models.pl_models.flow import DiscreteFlowModule
 from models.pl_models.space_group import SpaceGroupModule
 
@@ -52,18 +53,12 @@ def test_load_flow_model(tmp_path, stale_run_config):
         "conditional_composition": True,
     }
     decoder = {
-        "_target_": "models.pl_models.gnn.WyckoffGNN",
-        "composition_encoder_dim": 4,
-        "composition_film": False,
+        "_target_": "models.pl_models.crystal_gnn.CrystalGNN",
         "num_gnn_layers": 1,
         "hidden_dim": 8,
-        "dof_pos_sg_emb_size": 4,
-        "gnn_activation": "SiLU",
-        "no_multiplicity_encoding": False,
-        "binary_dof_encoding": False,
-        "no_softmax": False,
-        "mlp_hidden_layers": 2,
-        "mlp_activation": "SiLU",
+        "element_dim": 4,
+        "num_heads": 2,
+        "dropout": 0.0,
     }
     model = DiscreteFlowModule(
         optimizer_config=OPTIMIZER_CONFIG,
@@ -101,17 +96,21 @@ def test_load_flow_model(tmp_path, stale_run_config):
         torch.testing.assert_close(loaded.state_dict()[key], value)
 
 
-def test_load_space_group_model(tmp_path):
+@pytest.mark.parametrize("composition_encoder_dim", [None, 4])
+def test_load_space_group_model(tmp_path, composition_encoder_dim):
     config = {
         "num_elements": 118,
         "max_num_atoms": 8,
         "hidden_dim": 8,
-        "composition_encoder_dim": 4,
+        "composition_encoder_dim": composition_encoder_dim,
         "compatibility": False,
         "mlp_hidden_layers": 2,
         "mlp_activation": "SiLU",
     }
-    model = SpaceGroupModule(optimizer_config=OPTIMIZER_CONFIG, **config)
+    model = SpaceGroupModule(optimizer_config=OPTIMIZER_CONFIG, **config).eval()
+    composition = formula_to_counts("Li2O2", model.num_elements)[None]
+    with torch.no_grad():
+        expected = model.predictor(composition)
     path = tmp_path / "space_group"
     save_run(model, path)
 
@@ -121,6 +120,8 @@ def test_load_space_group_model(tmp_path):
     assert not loaded.training
     assert loaders is None
     assert config.model._target_ == "models.pl_models.space_group.SpaceGroupModule"
+    with torch.no_grad():
+        torch.testing.assert_close(loaded.predictor(composition), expected, rtol=0, atol=0)
 
 
 def test_load_model_from_checkpoint_path(tmp_path):

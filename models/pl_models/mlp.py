@@ -18,7 +18,7 @@ class MLP(nn.Sequential):
         unexpected_keys,
         error_msgs,
     ):
-        # Older get_mlp omitted dropout layers in the SG and WyckoffGNN MLPs.
+        # Older get_mlp omitted dropout layers in some model MLPs.
         # Translate that layout here so callers only handle probabilities.
         if local_metadata.get("version", 1) < 2:
             legacy_keys = {}

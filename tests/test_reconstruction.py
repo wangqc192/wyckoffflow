@@ -58,14 +58,12 @@ def small_model():
         max_num_atoms=4,
         flow_source="zeros",
         decoder={
-            "_target_": "models.pl_models.gnn.WyckoffGNN",
+            "_target_": "models.pl_models.crystal_gnn.CrystalGNN",
             "hidden_dim": 8,
-            "dof_pos_sg_emb_size": 4,
+            "element_dim": 4,
             "num_gnn_layers": 1,
-            "gnn_activation": "SiLU",
-            "mlp_hidden_layers": 2,
-            "mlp_activation": "SiLU",
-            "composition_encoder_dim": 4,
+            "num_heads": 2,
+            "dropout": 0.0,
         },
     )
 

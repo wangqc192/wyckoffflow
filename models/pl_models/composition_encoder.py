@@ -25,13 +25,38 @@ class CompositionFeatures(NamedTuple):
 
 
 class CrystalCompositionEncoder(nn.Module):
-    """Static chemical features shared by space-group and occupation prediction."""
+    """Encode element counts into per-element and pooled static features.
 
-    def __init__(self, num_elements, element_dim, hidden_dim):
+    Defaults match the shared Joint encoder. MLP settings and the species-count
+    feature also support the standalone SG encoder's existing parameter layout.
+    """
+
+    def __init__(
+        self,
+        num_elements,
+        element_dim,
+        hidden_dim,
+        *,
+        mlp_hidden_dim=None,
+        num_hidden_layers=1,
+        activation="SiLU",
+        include_species_count=True,
+    ):
         super().__init__()
+        self.include_species_count = include_species_count
+        if mlp_hidden_dim is None:
+            mlp_hidden_dim = hidden_dim
         self.element_embedding = nn.Embedding(num_elements + 1, element_dim)
-        self.token_encoder = get_mlp(element_dim + 2, hidden_dim, hidden_dim)
-        self.global_composition_encoder = get_mlp(2, hidden_dim, hidden_dim)
+        self.token_encoder = get_mlp(
+            element_dim + 2, hidden_dim, mlp_hidden_dim, num_hidden_layers, activation
+        )
+        self.global_composition_encoder = get_mlp(
+            2 if include_species_count else 1,
+            hidden_dim,
+            mlp_hidden_dim,
+            num_hidden_layers,
+            activation,
+        )
         self._register_load_state_dict_pre_hook(_load_legacy_global_composition)
 
     def forward(self, composition):
@@ -53,7 +78,10 @@ class CrystalCompositionEncoder(nn.Module):
         )
         tokens = tokens * present.unsqueeze(-1)
         pooled = tokens.sum(dim=1) / species
-        pooled = pooled + self.global_composition_encoder(
-            torch.cat((total.log1p(), species.float().log1p()), dim=-1)
-        )
+        global_features = total.log1p()
+        if self.include_species_count:
+            global_features = torch.cat(
+                (global_features, species.float().log1p()), dim=-1
+            )
+        pooled = pooled + self.global_composition_encoder(global_features)
         return CompositionFeatures(embeddings, tokens, pooled)
