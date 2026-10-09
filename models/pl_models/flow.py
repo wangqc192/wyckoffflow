@@ -60,9 +60,11 @@ class DiscreteFlowModule(OptimizedLightningModule):
         validation_seed=42,
         label_smoothing=0.0,
         loss_type="cross_entropy",
+        scheduler_config=None,
     ):
-        super().__init__(optimizer_config, "discrete_flow")
+        super().__init__(optimizer_config, "discrete_flow", scheduler_config)
         decoder = resolve_config(decoder)
+        scheduler_config = self.scheduler_config
         self.save_hyperparameters(ignore=["optimizer_config"])
         self.validation_seed = validation_seed
         self._validation_rng = None

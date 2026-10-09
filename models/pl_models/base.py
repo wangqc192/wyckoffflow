@@ -17,9 +17,12 @@ def resolve_config(config: Mapping[str, Any] | DictConfig) -> dict[str, Any]:
 class OptimizedLightningModule(pl.LightningModule):
     """Lightning module configured with a Hydra optimizer."""
 
-    def __init__(self, optimizer_config, task):
+    def __init__(self, optimizer_config, task, scheduler_config=None):
         super().__init__()
         self.optimizer_config = resolve_config(optimizer_config)
+        self.scheduler_config = (
+            resolve_config(scheduler_config) if scheduler_config is not None else None
+        )
         self.task = task
         self.save_hyperparameters(
             {
@@ -29,7 +32,14 @@ class OptimizedLightningModule(pl.LightningModule):
         )
 
     def configure_optimizers(self):
-        return hydra.utils.instantiate(
+        optimizer = hydra.utils.instantiate(
             self.optimizer_config,
             params=self.parameters(),
         )
+        if self.scheduler_config is None:
+            return optimizer
+        config = dict(self.scheduler_config)
+        config["scheduler"] = hydra.utils.instantiate(
+            config["scheduler"], optimizer=optimizer
+        )
+        return {"optimizer": optimizer, "lr_scheduler": config}

@@ -7,7 +7,7 @@ import hydra
 import pytorch_lightning as pl
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 
 from models.common.reconstruction import ValidationReconstruction
 from models.common.utils import PROJECT_ROOT
@@ -58,6 +58,8 @@ def build_callbacks(config: DictConfig) -> list[pl.Callback]:
             auto_insert_metric_name=False,
         ),
     ]
+    if config.model.get("scheduler_config"):
+        callbacks.append(LearningRateMonitor(logging_interval="epoch"))
     reconstruction = config.train.reconstruction
     if reconstruction.enabled:
         callbacks.append(

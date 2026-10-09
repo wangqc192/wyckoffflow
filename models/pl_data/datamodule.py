@@ -45,6 +45,7 @@ class CrystDataModule(pl.LightningDataModule):
         batch_size: Mapping[str, int],
         pin_memory: bool = False,
         prototype_sampling_alpha: float = 0.0,
+        shuffle_seed: int | None = None,
     ) -> None:
         super().__init__()
         self.datasets = datasets
@@ -52,6 +53,11 @@ class CrystDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.pin_memory = pin_memory
         self.prototype_sampling_alpha = float(prototype_sampling_alpha)
+        self.train_generator = (
+            torch.Generator().manual_seed(shuffle_seed)
+            if shuffle_seed is not None
+            else None
+        )
         if self.prototype_sampling_alpha < 0:
             raise ValueError("prototype_sampling_alpha must be non-negative")
 
@@ -101,6 +107,7 @@ class CrystDataModule(pl.LightningDataModule):
                 weights=weights,
                 num_samples=len(self.train_dataset),
                 replacement=True,
+                generator=self.train_generator,
             )
             shuffle = False
         return DataLoader(
@@ -111,6 +118,7 @@ class CrystDataModule(pl.LightningDataModule):
             num_workers=self.num_workers.train,
             pin_memory=self.pin_memory,
             worker_init_fn=worker_init_fn,
+            generator=self.train_generator,
         )
 
     def val_dataloader(self) -> Sequence[DataLoader]:

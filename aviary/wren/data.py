@@ -258,6 +258,8 @@ def collate_batch(
 
 def parse_protostructure_label(
     protostructure_label: str,
+    *,
+    augment: bool = True,
 ) -> tuple[str, list[float], list[str], list[tuple[str, ...]]]:
     """Parse the Wren AFLOW-like Wyckoff encoding.
 
@@ -265,6 +267,8 @@ def parse_protostructure_label(
         protostructure_label (str): label constructed as `aflow_label:chemsys` where
             aflow_label is an AFLOW-style prototype label chemsys is the alphabetically
             sorted chemical system.
+        augment (bool): Include equivalent Wyckoff relabelings. If false, return
+            only the setting written in the input label.
 
     Returns:
         tuple[str, list[float], list[str], list[str]]: spacegroup number, Wyckoff site
@@ -303,6 +307,9 @@ def parse_protostructure_label(
             wyckoff_site_multiplicities.extend(
                 [float(wyckoff_multiplicity_dict[spg_num][letter])] * mult
             )
+
+    if not augment:
+        return spg_num, wyckoff_site_multiplicities, elements, [tuple(wyckoff_set)]
 
     # Create augmented Wyckoff set
     augmented_wyckoff_set = {

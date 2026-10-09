@@ -10,9 +10,11 @@ from typing import Any
 
 import pandas as pd
 import torch
-from aviary.wren.utils import get_prototype_from_protostructure
 from torch.utils.data import Dataset
 from torch_geometric.data import Data
+
+from aviary.wren.data import parse_protostructure_label
+from aviary.wren.utils import get_prototype_from_protostructure
 
 from .preprocess import (
     _composition_from_wyckoff_matrix,
@@ -36,6 +38,10 @@ class CrystalDataset(Dataset):
     keeps the original skeleton's intentionally small interface while accepting
     these convenient input forms. ``preprocess_options`` forwards CSV cache,
     worker and symmetry settings to :func:`preprocess`.
+
+    With ``augment_equivalent_templates=False``, use the setting stored in each
+    record's ``aflow_label``. Records must retain ``wyckoff_set`` to identify that
+    setting in the cached matrices. Validation can keep augmentation enabled.
     """
 
     def __init__(
@@ -44,6 +50,7 @@ class CrystalDataset(Dataset):
         num_elements: int = 118,
         transform: Any = None,
         preprocess_options: Mapping[str, Any] | None = None,
+        augment_equivalent_templates: bool = True,
     ):
         super().__init__()
         if not isinstance(num_elements, int) or num_elements < 1:
@@ -51,6 +58,16 @@ class CrystalDataset(Dataset):
         self.num_elements = num_elements
         self.transform = transform
         self.data = self._load(data, **dict(preprocess_options or {}))
+        self.augment_equivalent_templates = augment_equivalent_templates
+        self._fixed_template_indices = None
+        if not augment_equivalent_templates:
+            self._fixed_template_indices = []
+            for record in self.data:
+                original = parse_protostructure_label(
+                    record["aflow_label"], augment=False
+                )[3][0]
+                settings = [tuple(setting) for setting in record["wyckoff_set"]]
+                self._fixed_template_indices.append(settings.index(original))
         self._prototype_keys: tuple[str, ...] | None = None
 
     @staticmethod
@@ -139,6 +156,10 @@ class CrystalDataset(Dataset):
             n_sets = int(getattr(data, "num_sets", torch.tensor([1])).reshape(-1)[0])
             if n_sets > 1 and data.x.shape[0] == n_sets * n_pos:
                 selected = torch.randint(n_sets, (1,)).item()
+                if self._fixed_template_indices is not None:
+                    # Retain the control's RNG draw so disabling augmentation
+                    # does not shift later training noise or dropout draws.
+                    selected = self._fixed_template_indices[index]
                 data.x = data.x[selected * n_pos : (selected + 1) * n_pos]
             if hasattr(data, "zero_dof"):
                 data.x_0_dof = data.x[data.zero_dof, 0]

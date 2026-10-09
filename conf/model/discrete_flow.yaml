@@ -16,3 +16,4 @@ conditional_composition: true
 mask_loss_by_composition: true
 
 validation_seed: ${seed}
+scheduler_config: null
