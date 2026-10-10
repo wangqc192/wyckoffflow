@@ -1,7 +1,8 @@
-"""Convert MP20 labels or MatterGen CIFs to equivalent Wyckoff templates."""
+"""Convert MP20 labels, CIFs or ALEX structures to equivalent Wyckoff templates."""
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import multiprocessing
@@ -13,12 +14,13 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-import aviary.wren.data as aviary_wren_data
 import numpy as np
 import pandas as pd
 import torch
-from aviary.wren.utils import get_protostructure_label_from_spglib
 from pymatgen.core import Structure
+
+import aviary.wren.data as aviary_wren_data
+from aviary.wren.utils import get_protostructure_label_from_spglib
 
 from ..common.lookup_tables import (
     chemical_symbols,
@@ -41,7 +43,7 @@ def extract_wyckoff_data_and_properties(
     symprec: float = 0.1,
     fallback_symprec: float | None = 1e-5,
 ) -> pd.Series:
-    """Parse an existing label, or derive it from the CIF when absent."""
+    """Parse an existing label, or derive it from the crystal structure."""
 
     label = data_frame_row.get("wyckoff_spglib")
     if pd.isna(label):
@@ -56,15 +58,24 @@ def extract_wyckoff_data_and_properties(
                     "ignore",
                     message="Issues encountered while parsing CIF:.*fractional coordinates rounded.*",
                 )
-                structure = Structure.from_str(data_frame_row["cif"], fmt="cif")
+                cif = data_frame_row.get("cif")
+                if pd.notna(cif):
+                    structure = Structure.from_str(cif, fmt="cif")
+                else:
+                    structure_dict = data_frame_row["structure"]
+                    if isinstance(structure_dict, str):
+                        structure_dict = ast.literal_eval(structure_dict)
+                    structure = Structure.from_dict(structure_dict)
                 label = get_protostructure_label_from_spglib(
                     structure,
                     raise_errors=True,
                     init_symprec=symprec,
                     fallback_symprec=fallback_symprec,
                 )
-        except ValueError as exc:
-            identifier = data_frame_row.get("material_id", data_frame_row.name)
+        except (ValueError, SyntaxError) as exc:
+            identifier = data_frame_row.get(
+                "material_id", data_frame_row.get("mat_id", data_frame_row.name)
+            )
             raise ValueError(
                 f"Could not extract Wyckoff template for {identifier}: {exc}"
             ) from exc
@@ -72,7 +83,9 @@ def extract_wyckoff_data_and_properties(
     # Aviary returns equivalent settings from a set; keep cache ordering stable
     # across worker processes without changing the element/site correspondence.
     wyckoff_set = sorted(wyckoff_set)
-    e_form_per_atom = data_frame_row.get("formation_energy_per_atom", float("nan"))
+    e_form_per_atom = data_frame_row.get(
+        "formation_energy_per_atom", data_frame_row.get("e_form", float("nan"))
+    )
 
     return pd.Series(
         {
@@ -241,14 +254,16 @@ def preprocess_dataframe(
     symprec: float = 0.1,
     fallback_symprec: float | None = 1e-5,
 ) -> pd.DataFrame:
-    """Convert raw labels/CIFs; absent formation energies remain NaN.
+    """Convert raw labels/CIFs/structure dictionaries; missing energies are NaN.
 
     The CSV's ``space_group`` field may be a symbol or a placeholder. The
     model's numeric space group always comes from the extracted template.
     """
 
-    if not {"wyckoff_spglib", "cif"}.intersection(wd_df.columns):
-        raise ValueError("Raw crystal data requires 'wyckoff_spglib' or 'cif'")
+    if not {"wyckoff_spglib", "cif", "structure"}.intersection(wd_df.columns):
+        raise ValueError(
+            "Raw crystal data requires 'wyckoff_spglib', 'cif' or 'structure'"
+        )
     if wd_df.empty:
         return pd.DataFrame(columns=_PROCESSED_COLUMNS)
 
@@ -269,6 +284,8 @@ def preprocess_dataframe(
     parsed["multiplicities"] = parsed["space_group"].map(fetch_wyckoff_multiplicities)
     if "material_id" in wd_df:
         parsed["material_id"] = wd_df["material_id"]
+    elif "mat_id" in wd_df:
+        parsed["material_id"] = wd_df["mat_id"]
     return parsed.reset_index(drop=True)
 
 
@@ -385,7 +402,7 @@ def preprocess(
     force: bool = False,
     **options: Any,
 ) -> pd.DataFrame:
-    """Read a label/CIF CSV, preparing or reusing its model-ready cache."""
+    """Read a label/CIF/structure CSV, preparing or reusing its model-ready cache."""
 
     return load_preprocessed(
         prepare_preprocessed(raw_file_path, processed_file_path, force, **options)

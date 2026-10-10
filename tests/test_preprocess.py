@@ -36,6 +36,29 @@ def cif_frame():
     )
 
 
+@pytest.fixture
+def alex_frame(cif_frame):
+    return pd.DataFrame(
+        {
+            "mat_id": cif_frame.material_id,
+            "structure": [
+                repr(Structure.from_str(cif, fmt="cif").as_dict())
+                for cif in cif_frame.cif
+            ],
+            "e_form": [-1.5, -1.6],
+            "e_above_hull": [0.1, 0.2],
+            # These source annotations must not override structure extraction.
+            "spg": [1, 1],
+            "wyckoff_sites": [2, 2],
+        }
+    )
+
+
+@pytest.fixture(params=["cif_frame", "alex_frame"])
+def raw_frame(request):
+    return request.getfixturevalue(request.param)
+
+
 def test_cif_templates_preserve_equivalents_and_conventional_composition(cif_frame):
     parsed = preprocess_dataframe(cif_frame)
     assert parsed.space_group.tolist() == ["225", "225"]
@@ -58,21 +81,68 @@ def test_cif_templates_preserve_equivalents_and_conventional_composition(cif_fra
 
 
 @pytest.mark.parametrize("input_type", ["frame", "records", "record", "series"])
-def test_cif_dataset_input_forms_and_batching(cif_frame, input_type):
+def test_dataset_input_forms_and_batching(raw_frame, input_type):
     data = {
-        "frame": cif_frame,
-        "records": cif_frame.to_dict("records"),
-        "record": cif_frame.iloc[0].to_dict(),
-        "series": cif_frame.iloc[0],
+        "frame": raw_frame,
+        "records": raw_frame.to_dict("records"),
+        "record": raw_frame.iloc[0].to_dict(),
+        "series": raw_frame.iloc[0],
     }[input_type]
     dataset = CrystalDataset(data, num_elements=100)
     batch = next(iter(DataLoader(dataset, batch_size=2)))
     assert batch.num_graphs == len(dataset)
     assert batch.composition.shape == (len(dataset), 101)
     assert batch.composition.sum(dim=1).tolist() == [8] * len(dataset)
-    assert batch.material_id == cif_frame.material_id.tolist()[: len(dataset)]
-    assert torch.isnan(batch.e_form_per_atom).all()
+    identifiers = raw_frame.get("material_id", raw_frame.get("mat_id"))
+    assert batch.material_id == identifiers.tolist()[: len(dataset)]
+    if "e_form" in raw_frame:
+        torch.testing.assert_close(
+            batch.e_form_per_atom,
+            torch.tensor(raw_frame.e_form.tolist()[: len(dataset)]),
+        )
+    else:
+        assert torch.isnan(batch.e_form_per_atom).all()
     assert len(set(dataset.prototype_keys)) == 1
+
+
+def test_alex_templates_match_cif_equivalents(alex_frame, cif_frame):
+    parsed = preprocess_dataframe(alex_frame)
+    expected = preprocess_dataframe(cif_frame)
+    assert parsed.aflow_label.tolist() == expected.aflow_label.tolist()
+    assert parsed.space_group.tolist() == ["225", "225"]
+    assert parsed.wyckoff_set.tolist() == expected.wyckoff_set.tolist()
+    for actual_matrix, expected_matrix in zip(
+        parsed.wyckoff_element_matrix, expected.wyckoff_element_matrix
+    ):
+        np.testing.assert_array_equal(actual_matrix, expected_matrix)
+
+
+def test_alex_accepts_structure_dictionary(alex_frame):
+    record = alex_frame.iloc[0].to_dict()
+    record["structure"] = Structure.from_spacegroup(
+        225, Lattice.cubic(5.64), ["Na", "Cl"], [[0, 0, 0], [0.5, 0.5, 0.5]]
+    ).as_dict()
+    graph = CrystalDataset(record)[0]
+    assert graph.space_group.item() == 225
+    assert graph.material_id == record["mat_id"]
+    assert graph.e_form_per_atom.item() == record["e_form"]
+
+
+def test_alex_preserves_canonical_labels_and_metadata(alex_frame):
+    raw = alex_frame.copy()
+    raw["wyckoff_spglib"] = "AB_cF8_225_a_b:Cl-Na"
+    raw["structure"] = "unused"
+    raw["material_id"] = ["canonical-1", "canonical-2"]
+    raw["formation_energy_per_atom"] = [-2.0, -2.1]
+    parsed = preprocess_dataframe(raw)
+    assert parsed.aflow_label.tolist() == raw.wyckoff_spglib.tolist()
+    assert parsed.material_id.tolist() == raw.material_id.tolist()
+    np.testing.assert_allclose(parsed.e_form_per_atom, raw.formation_energy_per_atom)
+
+
+def test_alex_missing_formation_energy_stays_nan(alex_frame):
+    parsed = preprocess_dataframe(alex_frame.drop(columns="e_form"))
+    assert parsed.e_form_per_atom.isna().all()
 
 
 def test_existing_mp20_labels_and_formation_energies_are_preserved():
@@ -92,15 +162,16 @@ def test_missing_energy_does_not_require_a_cif():
 
 
 def test_parallel_cache_matches_serial_and_reuses_cache(
-    cif_frame, tmp_path, monkeypatch
+    raw_frame, tmp_path, monkeypatch
 ):
     source = tmp_path / "input.csv"
     output = tmp_path / "cache" / "input.pt"
-    cif_frame.to_csv(source, index=False)
-    expected = preprocess_dataframe(cif_frame)
+    raw_frame.to_csv(source, index=False)
+    expected = preprocess_dataframe(raw_frame)
     actual = preprocess(source, output, num_workers=2, chunk_size=1)
     assert actual.aflow_label.tolist() == expected.aflow_label.tolist()
     assert actual.material_id.tolist() == expected.material_id.tolist()
+    np.testing.assert_allclose(actual.e_form_per_atom, expected.e_form_per_atom)
     for left, right in zip(
         actual.wyckoff_element_matrix, expected.wyckoff_element_matrix
     ):
@@ -142,16 +213,26 @@ def test_cache_tracks_source_and_symmetry_settings(cif_frame, tmp_path):
     ]
 
 
-def test_alex_config_trains_without_test_csv(cif_frame, tmp_path):
-    for split in ("train", "val"):
-        cif_frame.to_csv(tmp_path / f"{split}.csv", index=False)
+@pytest.mark.parametrize(
+    "data_config,frame_fixture,splits",
+    [
+        ("alex_mp_20", "cif_frame", ("train", "val")),
+        ("alex", "alex_frame", ("train", "val", "test")),
+    ],
+)
+def test_alex_configs_load_splits_and_train(
+    data_config, frame_fixture, splits, request, tmp_path
+):
+    raw = request.getfixturevalue(frame_fixture)
+    for split in splits:
+        raw.to_csv(tmp_path / f"{split}.csv", index=False)
     with initialize_config_dir(
         config_dir=str(PROJECT_ROOT / "conf"), version_base="1.3"
     ):
         config = compose(
             config_name="default",
             overrides=[
-                "data=alex_mp_20",
+                f"data={data_config}",
                 f"data.root_path={tmp_path}",
                 f"data.cache_path={tmp_path}/cache",
                 "data.preprocess.num_workers=0",
@@ -164,11 +245,20 @@ def test_alex_config_trains_without_test_csv(cif_frame, tmp_path):
     datamodule = hydra.utils.instantiate(config.data.datamodule, _recursive_=False)
     datamodule.prepare_data()
     datamodule.setup("fit")
-    assert len(datamodule.train_dataset) == len(cif_frame)
-    assert len(datamodule.val_datasets[0]) == len(cif_frame)
-    assert datamodule.test_datasets == []
-    assert (tmp_path / "cache/train.pt").exists()
-    assert (tmp_path / "cache/val.pt").exists()
+    assert config.data.dataset_name == data_config
+    assert len(datamodule.train_dataset) == len(raw)
+    assert len(datamodule.val_datasets[0]) == len(raw)
+    if "test" in splits:
+        assert len(datamodule.test_datasets[0]) == len(raw)
+        batch = next(iter(datamodule.test_dataloader()[0]))
+        assert batch.material_id == raw.mat_id.tolist()
+        torch.testing.assert_close(
+            batch.e_form_per_atom, torch.tensor(raw.e_form.tolist())
+        )
+    else:
+        assert datamodule.test_datasets == []
+    for split in splits:
+        assert (tmp_path / "cache" / f"{split}.pt").exists()
     model = hydra.utils.instantiate(
         config.model, optimizer_config=config.optim, _recursive_=False
     )
@@ -182,4 +272,12 @@ def test_invalid_cif_reports_material_id():
     with pytest.raises(ValueError, match="bad-material"):
         preprocess_dataframe(
             pd.DataFrame([{"material_id": "bad-material", "cif": "bad"}])
+        )
+
+
+@pytest.mark.parametrize("structure", ["bad", "{'lattice':"])
+def test_invalid_alex_structure_reports_mat_id(structure):
+    with pytest.raises(ValueError, match="bad-alex"):
+        preprocess_dataframe(
+            pd.DataFrame([{"mat_id": "bad-alex", "structure": structure}])
         )

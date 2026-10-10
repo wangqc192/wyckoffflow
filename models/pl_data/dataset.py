@@ -96,11 +96,12 @@ class CrystalDataset(Dataset):
             and {
                 "wyckoff_spglib",
                 "cif",
+                "structure",
             }.intersection(data)
         ):
             data = pd.DataFrame([data])
         if isinstance(data, pd.DataFrame):
-            if {"wyckoff_spglib", "cif"}.intersection(data.columns):
+            if {"wyckoff_spglib", "cif", "structure"}.intersection(data.columns):
                 data = preprocess_dataframe(data, **symmetry_options)
             return data.to_dict("records")
         if isinstance(data, (pd.Series, Mapping, Data)):
@@ -112,7 +113,7 @@ class CrystalDataset(Dataset):
         if (
             records
             and isinstance(records[0], Mapping)
-            and {"wyckoff_spglib", "cif"}.intersection(records[0])
+            and {"wyckoff_spglib", "cif", "structure"}.intersection(records[0])
         ):
             records = preprocess_dataframe(
                 pd.DataFrame(records), **symmetry_options
