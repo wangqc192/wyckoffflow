@@ -2,7 +2,7 @@ defaults:
   - default
   - _self_
 
-root_path: ${hydra:runtime.cwd}/data
+root_path: ${hydra:runtime.cwd}/data/alex
 cache_path: ${hydra:runtime.cwd}/data/alex
 dataset_name: alex
 
